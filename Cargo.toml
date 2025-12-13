@@ -3,10 +3,10 @@ name = "tokio-memq"
 version = "0.1.0"
 edition = "2021"
 description = "Simple, high-performance in-memory async message queue"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/weiwangfds/tokio-memq"
 readme = "README.md"
-documentation = "https://docs.rs/tokio_memq"
+documentation = "https://docs.rs/tokio-memq"
 keywords = ["async", "mq", "message-queue", "tokio", "in-memory"]
 categories = ["asynchronous", "concurrency", "data-structures"]
 
