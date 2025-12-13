@@ -1,5 +1,8 @@
 # Tokio MemQ
 
+[![Crates.io](https://img.shields.io/crates/v/tokio-memq.svg)](https://crates.io/crates/tokio-memq)
+[![docs.rs](https://img.shields.io/docsrs/tokio-memq)](https://docs.rs/tokio-memq)
+
 Simple, high-performance in-memory async message queue powered by Tokio.
 
 ## Features
