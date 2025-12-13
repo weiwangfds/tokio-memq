@@ -99,6 +99,114 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+## Serialization Examples
+
+Tokio MemQ 提供可插拔的序列化机制，默认使用 Bincode。你也可以选择 JSON、MessagePack 或注册自定义格式。
+
+### Basic: Bincode / JSON / MessagePack
+
+```rust
+use serde::{Serialize, Deserialize};
+use tokio_memq::{SerializationHelper, SerializationFormat};
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct User { id: u32, name: String }
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let u = User { id: 1, name: "alice".into() };
+
+    // Bincode
+    let bin = SerializationHelper::serialize(&u, &SerializationFormat::Bincode)?;
+    let u1: User = SerializationHelper::deserialize(&bin, &SerializationFormat::Bincode)?;
+    assert_eq!(u, u1);
+
+    // JSON
+    let json = SerializationHelper::serialize(&u, &SerializationFormat::Json)?;
+    let u2: User = SerializationHelper::deserialize(&json, &SerializationFormat::Json)?;
+    assert_eq!(u, u2);
+
+    // MessagePack
+    let msg = SerializationHelper::serialize(&u, &SerializationFormat::MessagePack)?;
+    let u3: User = SerializationHelper::deserialize(&msg, &SerializationFormat::MessagePack)?;
+    assert_eq!(u, u3);
+
+    Ok(())
+}
+```
+
+### JSON Pretty
+
+```rust
+use serde::{Serialize, Deserialize};
+use tokio_memq::{SerializationHelper, SerializationFormat};
+use tokio_memq::mq::serializer::{SerializationFactory, SerializationConfig, JsonConfig};
+
+#[derive(Serialize, Deserialize)]
+struct Item { id: u32, title: String }
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let s = SerializationFactory::create_serializer(
+        "json",
+        SerializationConfig::Json(JsonConfig { pretty: true })
+    )?;
+
+    let it = Item { id: 7, title: "doc".into() };
+    let bytes = s.serialize(&it)?; // pretty JSON
+    let txt = String::from_utf8(bytes)?;
+    assert!(txt.contains('\n'));
+
+    // 仍可用帮助器进行反序列化
+    let it2: Item = SerializationHelper::deserialize(txt.as_bytes(), &SerializationFormat::Json)?;
+    assert_eq!(it.id, it2.id);
+    Ok(())
+}
+```
+
+### Register Custom Format
+
+```rust
+use std::sync::Arc;
+use erased_serde::{Serialize as ErasedSerialize, Deserializer as ErasedDeserializer};
+use tokio_memq::mq::serializer::{
+    Serializer, Deserializer, SerializationFormat, SerializationError,
+    SerializationFactory,
+};
+
+#[derive(Default, Clone)]
+struct MyFmt;
+
+impl Serializer for MyFmt {
+    fn serialize(&self, _data: &dyn ErasedSerialize) -> Result<Vec<u8>, SerializationError> {
+        Ok(Vec::new())
+    }
+    fn format(&self) -> SerializationFormat {
+        SerializationFormat::Custom("myfmt".into())
+    }
+}
+
+impl Deserializer for MyFmt {
+    fn with_deserializer(
+        &self,
+        _data: &[u8],
+        f: &mut dyn FnMut(&mut dyn ErasedDeserializer) -> Result<(), SerializationError>
+    ) -> Result<(), SerializationError> {
+        // 构造你的反序列化器并进行类型擦除后调用闭包
+        // let mut de = myfmt::Deserializer::new(_data);
+        // let mut erased = <dyn ErasedDeserializer>::erase(&mut de);
+        // f(&mut erased)
+        Ok(())
+    }
+    fn format(&self) -> SerializationFormat {
+        SerializationFormat::Custom("myfmt".into())
+    }
+}
+
+fn main() {
+    SerializationFactory::register_serializer("myfmt", Arc::new(MyFmt::default()));
+    SerializationFactory::register_deserializer("myfmt", Arc::new(MyFmt::default()));
+}
+```
+
 ## License
 
 Licensed under either of

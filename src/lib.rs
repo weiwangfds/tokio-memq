@@ -7,6 +7,7 @@
 //! Basic publish/subscribe:
 //! ```rust
 //! use tokio_memq::MessageQueue;
+//! use tokio_memq::MessageSubscriber;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -26,6 +27,7 @@
 //! Consumer groups and offsets:
 //! ```rust
 //! use tokio_memq::{MessageQueue, ConsumptionMode};
+//! use tokio_memq::MessageSubscriber;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
