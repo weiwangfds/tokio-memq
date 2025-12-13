@@ -279,6 +279,61 @@ flowchart LR
   SUB -- deserialize --> SER
 ```
 
+- ## Sequence Diagram
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant App
+  participant PUB as Publisher
+  participant SER as Serialization
+  participant MQ as MessageQueue
+  participant TM as TopicManager
+  participant TC as TopicChannel
+  participant NOTIF as Notify
+  participant SUB as Subscriber
+  participant OFFS as ConsumerOffsets
+
+  App->>TM: create topic with options (optional)
+  TM->>TC: provision channel
+
+  App->>MQ: subscriber or subscriber group with options
+  MQ->>TM: subscribe
+  TM->>TC: add subscriber (mode, consumer id)
+  TC->>OFFS: init offset for group or local
+  TC-->>SUB: provide notify receiver
+
+  App->>PUB: publish data
+  PUB->>SER: serialize with defaults
+  SER-->>PUB: bytes and format
+  PUB->>MQ: publish message
+  MQ->>TM: get or create topic
+  TM->>TC: add to buffer
+  TC->>TC: ttl cleanup
+  TC->>TC: lru eviction
+  TC->>TC: assign offset
+  TC->>TC: push to buffer
+  TC-->>NOTIF: send next offset
+
+  SUB->>NOTIF: wait changed
+  SUB->>TC: fetch by target offset
+  TC-->>SUB: message
+  SUB->>SUB: advance next offset
+  SUB->>SER: deserialize
+  SER-->>SUB: data
+
+  App->>SUB: commit offset (optional)
+  SUB->>OFFS: persist next offset
+
+  App->>SUB: seek offset (optional)
+  SUB->>OFFS: set target offset
+
+  App->>PUB: publish batch (optional)
+  PUB->>MQ: publish batch
+  MQ->>TM: group by topic
+  TM->>TC: add batch to buffer
+```
+
 - Data Path: `Publisher -> MessageQueue -> TopicManager -> TopicChannel -> Buffer -> Subscriber`
 - Flow Control: `watch::Sender/Receiver` used for notification; `max_messages` and TTL enforce retention; LRU via front eviction
 - Offsets: `next_offset` atomically allocates; consumer group offsets stored in `RwLock<HashMap>`
