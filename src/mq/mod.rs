@@ -7,10 +7,21 @@ pub mod broker;
 
 pub use traits::{MessagePublisher, AsyncMessagePublisher, MessageSubscriber, QueueManager};
 pub use message::{TopicMessage, TopicOptions, TimestampedMessage, ConsumptionMode};
-pub use serializer::{SerializationFormat, SerializationHelper, Serializer, BincodeSerializer};
+pub use serializer::{
+    SerializationFormat, 
+    SerializationHelper, 
+    Serializer, 
+    BincodeSerializer,
+    SerializationFactory,
+    SerializationConfig,
+    JsonConfig,
+    MessagePackConfig,
+    PipelineConfig,
+    CompressionConfig
+};
 pub use publisher::Publisher;
 pub use subscriber::Subscriber;
-pub use broker::TopicManager;
+pub use broker::{TopicManager, TopicStats};
 
 /// 简单高性能的异步内存消息队列
 /// 
@@ -30,11 +41,26 @@ impl MessageQueue {
         MessageQueue { topic_manager }
     }
 
+    /// 获取主题统计信息
+    ///
+    /// Get topic statistics.
+    pub async fn get_topic_stats(&self, topic: String) -> Option<TopicStats> {
+        self.topic_manager.get_topic_stats(&topic).await
+    }
+
+
     /// 创建指定主题的发布者
     ///
     /// Create a publisher for a topic.
     pub fn publisher(&self, topic: String) -> Publisher {
         Publisher::new(self.topic_manager.clone(), topic)
+    }
+
+    /// 创建带发布者键的发布者（每发布者独立默认设置）
+    ///
+    /// Create a publisher with a key (per-publisher defaults).
+    pub fn publisher_with_key(&self, topic: String, publisher_key: String) -> Publisher {
+        Publisher::new_with_key(self.topic_manager.clone(), topic, publisher_key)
     }
 
     /// 订阅指定主题（使用默认配置）
@@ -78,6 +104,13 @@ impl MessageQueue {
     pub async fn create_topic(&self, topic: String, options: TopicOptions) -> anyhow::Result<()> {
         self.topic_manager.get_or_create_topic_with_options(topic, options).await;
         Ok(())
+    }
+
+    /// 删除主题
+    ///
+    /// Delete a topic.
+    pub async fn delete_topic(&self, topic: &str) -> bool {
+        self.topic_manager.delete_topic(topic).await
     }
 }
 

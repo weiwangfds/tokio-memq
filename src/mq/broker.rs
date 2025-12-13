@@ -1,4 +1,3 @@
-use async_channel::{bounded, unbounded, Sender, Receiver};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Mutex, Notify};
@@ -9,6 +8,14 @@ use crate::mq::message::{TopicMessage, TopicOptions, TimestampedMessage, Consump
 use crate::mq::publisher::Publisher;
 use crate::mq::subscriber::Subscriber;
 
+#[derive(Debug, Clone)]
+pub struct TopicStats {
+    pub message_count: usize,
+    pub subscriber_count: usize,
+    pub dropped_messages: usize,
+    pub consumer_lags: HashMap<String, usize>,
+}
+
 #[derive(Clone)]
 pub struct TopicManager {
     topics: Arc<RwLock<HashMap<String, TopicChannel>>>,
@@ -16,34 +23,25 @@ pub struct TopicManager {
 
 #[derive(Clone)]
 pub struct TopicChannel {
-    pub sender: Sender<TopicMessage>,
-    pub receiver: Arc<Mutex<Receiver<TopicMessage>>>,
     subscriber_count: Arc<Mutex<usize>>,
     options: TopicOptions,
     message_buffer: Arc<Mutex<VecDeque<TimestampedMessage>>>,
     next_offset: Arc<Mutex<usize>>,
     consumer_offsets: Arc<RwLock<HashMap<String, usize>>>,
     notify: Arc<Notify>,
+    dropped_count: Arc<Mutex<usize>>,
 }
 
 impl TopicChannel {
     pub fn new(options: TopicOptions) -> Self {
-        let (sender, receiver) = if options.max_messages.is_some() {
-            let capacity = options.max_messages.unwrap();
-            bounded(capacity)
-        } else {
-            unbounded()
-        };
-        
         TopicChannel {
-            sender,
-            receiver: Arc::new(Mutex::new(receiver)),
             subscriber_count: Arc::new(Mutex::new(0)),
             options,
             message_buffer: Arc::new(Mutex::new(VecDeque::new())),
             next_offset: Arc::new(Mutex::new(0)),
             consumer_offsets: Arc::new(RwLock::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            dropped_count: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -52,6 +50,8 @@ impl TopicChannel {
         *count += 1;
 
         // 如果指定了消费者 ID，初始化偏移量 / If consumer ID is specified, initialize offset
+        let mut start_offset_local = 0;
+        
         if let Some(ref id) = consumer_id {
             debug!("检查消费者偏移量: {} / Checking consumer offset: {}", id, id);
             let has_offset = {
@@ -79,17 +79,38 @@ impl TopicChannel {
                     };
                     debug!("初始化消费者组偏移量 (Subscription Time), ID: {}, Mode: {:?}, Start Offset: {} / Initializing consumer group offset (Subscription Time), ID: {}, Mode: {:?}, Start Offset: {}", id, mode, start_offset, id, mode, start_offset);
                     offsets.insert(id.clone(), start_offset);
+                    start_offset_local = start_offset;
                 }
             } else {
                 debug!("消费者 {} 已存在偏移量 / Consumer {} already has offset", id, id);
+                // 如果已存在，读取它作为本地起始偏移量 (针对无 ID 订阅者逻辑复用，虽此时 consumer_id 有值)
+                // If exists, read it as local start offset (logic reuse, though consumer_id is Some)
+                let offsets = self.consumer_offsets.read().await;
+                start_offset_local = *offsets.get(id).unwrap_or(&0);
             }
+        } else {
+            // 无 ID 订阅者，仅在本地维护偏移量 / Subscriber without ID, maintain offset locally
+             let buffer = self.message_buffer.lock().await;
+             start_offset_local = match mode {
+                ConsumptionMode::Earliest => {
+                    buffer.front().map(|m| m.offset).unwrap_or(0)
+                },
+                ConsumptionMode::Latest => {
+                    buffer.back().map(|m| m.offset + 1).unwrap_or(0)
+                },
+                ConsumptionMode::Offset(offset) => offset,
+                ConsumptionMode::LastOffset => {
+                    buffer.back().map(|m| m.offset + 1).unwrap_or(0)
+                }
+            };
         }
         
         Subscriber::new(
-            String::new(),
-            Arc::clone(&self.receiver),
+            String::new(), // Topic name will be set by caller usually, but here passed empty? Wait, Subscriber::new takes topic name?
+            // Checking original Subscriber::new signature...
+            // It was taking receiver. Now we remove it.
             Arc::clone(&self.subscriber_count),
-            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(start_offset_local))), // Initialize local offset
             Arc::clone(&self.message_buffer),
             self.options.clone(),
             consumer_id,
@@ -102,12 +123,18 @@ impl TopicChannel {
     pub async fn cleanup_expired_messages(&self) {
         if let Some(ttl) = self.options.message_ttl {
             let mut buffer = self.message_buffer.lock().await;
+            let mut dropped = 0;
             while let Some(msg) = buffer.front() {
                 if msg.is_expired(ttl) {
                     buffer.pop_front();
+                    dropped += 1;
                 } else {
                     break;
                 }
+            }
+            if dropped > 0 {
+                let mut dropped_lock = self.dropped_count.lock().await;
+                *dropped_lock += dropped;
             }
         }
     }
@@ -121,11 +148,13 @@ impl TopicChannel {
         let timestamped_msg = TimestampedMessage::new(message, current_offset);
         
         let mut buffer = self.message_buffer.lock().await;
+        let mut dropped = 0;
         
         if let Some(ttl) = self.options.message_ttl {
             while let Some(msg) = buffer.front() {
                 if msg.is_expired(ttl) {
                     buffer.pop_front();
+                    dropped += 1;
                 } else {
                     break;
                 }
@@ -135,13 +164,120 @@ impl TopicChannel {
         if let Some(max_messages) = self.options.max_messages {
             while buffer.len() >= max_messages {
                 buffer.pop_front();
+                dropped += 1;
             }
         }
         
+        if dropped > 0 {
+            let mut dropped_lock = self.dropped_count.lock().await;
+            *dropped_lock += dropped;
+        }
+
         buffer.push_back(timestamped_msg);
         // 通知等待的订阅者 / Notify waiting subscribers
         self.notify.notify_waiters();
         Ok(())
+    }
+
+    pub async fn add_to_buffer_batch(&self, messages: Vec<TopicMessage>) -> anyhow::Result<()> {
+        let count = messages.len();
+        if count == 0 { return Ok(()); }
+
+        let mut offset_lock = self.next_offset.lock().await;
+        let start_offset = *offset_lock;
+        *offset_lock += count;
+        drop(offset_lock);
+        
+        let mut buffer = self.message_buffer.lock().await;
+        let mut dropped = 0;
+        
+        // 清理过期消息 / Clean expired messages
+        if let Some(ttl) = self.options.message_ttl {
+            while let Some(msg) = buffer.front() {
+                if msg.is_expired(ttl) {
+                    buffer.pop_front();
+                    dropped += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        // 检查容量并清理 / Check capacity and clean
+        if let Some(max_messages) = self.options.max_messages {
+            let total = buffer.len() + count;
+            if total > max_messages {
+                let to_remove = total - max_messages;
+                let buffer_remove_count = std::cmp::min(buffer.len(), to_remove);
+                for _ in 0..buffer_remove_count {
+                    buffer.pop_front();
+                    dropped += 1;
+                }
+            }
+        }
+
+        // 如果新消息本身超过容量，需要截断前面的 / If new messages exceed capacity, truncate the front
+        let msgs_to_add = if let Some(max_messages) = self.options.max_messages {
+             if count > max_messages {
+                 &messages[count - max_messages..]
+             } else {
+                 &messages[..]
+             }
+        } else {
+            &messages[..]
+        };
+
+        // 计算跳过的消息数量 / Calculate skipped messages count
+        let skip_count = messages.len() - msgs_to_add.len();
+        dropped += skip_count;
+
+        for (i, msg) in msgs_to_add.iter().enumerate() {
+            let original_index = skip_count + i;
+            let timestamped_msg = TimestampedMessage::new(msg.clone(), start_offset + original_index);
+            buffer.push_back(timestamped_msg);
+        }
+        
+        if let Some(max_messages) = self.options.max_messages {
+            while buffer.len() > max_messages {
+                buffer.pop_front();
+                dropped += 1;
+            }
+        }
+        
+        if dropped > 0 {
+            let mut dropped_lock = self.dropped_count.lock().await;
+            *dropped_lock += dropped;
+        }
+
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    pub async fn get_stats(&self) -> TopicStats {
+        let buffer = self.message_buffer.lock().await;
+        let message_count = buffer.len();
+        let subscriber_count = *self.subscriber_count.lock().await;
+        let dropped_messages = *self.dropped_count.lock().await;
+        
+        let mut consumer_lags = HashMap::new();
+        let offsets = self.consumer_offsets.read().await;
+        let next_offset = *self.next_offset.lock().await;
+        
+        for (id, offset) in offsets.iter() {
+            let lag = if next_offset >= *offset {
+                next_offset - *offset
+            } else {
+                0
+            };
+            consumer_lags.insert(id.clone(), lag);
+        }
+
+        TopicStats {
+            message_count,
+            subscriber_count,
+            dropped_messages,
+            consumer_lags,
+        }
     }
 
     pub async fn get_valid_message(&self) -> Option<TopicMessage> {
@@ -198,31 +334,39 @@ impl TopicManager {
         
         channel.add_to_buffer(message.clone()).await?;
         
-        // 如果开启了 LRU 且通道已满，则尝试淘汰旧消息 / If LRU is enabled and channel is full, try to evict old messages
-        if channel.options.lru_enabled {
-            match channel.sender.try_send(message.clone()) {
-                Ok(_) => {},
-                Err(async_channel::TrySendError::Full(_)) => {
-                    debug!("主题 {} 通道已满，触发 LRU 淘汰 / Topic {} channel full, triggering LRU eviction", message.topic, message.topic);
-                    {
-                        let receiver = channel.receiver.lock().await;
-                        // 丢弃最旧的一条消息 / Discard the oldest message
-                        if let Ok(_) = receiver.try_recv() {
-                            debug!("成功丢弃一条旧消息 / Successfully discarded an old message");
-                        }
-                    }
-                    // 再次尝试发送，如果还满则阻塞等待 / Try sending again, block and wait if still full
-                    channel.sender.send(message.clone()).await?;
-                },
-                Err(e) => return Err(anyhow::anyhow!(e)),
-            }
-        } else {
-            // 未开启 LRU，默认阻塞等待 / LRU not enabled, default blocking wait
-            channel.sender.send(message.clone()).await?;
-        }
+        // Removed async-channel logic as we unify backpressure to buffer-only
+        // LRU eviction is now handled inside add_to_buffer
         
-        debug!("消息已成功发布到主题: {} / Message successfully published to topic: {}", channel.sender.receiver_count(), channel.sender.receiver_count());
+        debug!("消息已成功发布到主题: {} / Message successfully published to topic: {}", message.topic, message.topic);
         Ok(())
+    }
+
+    pub async fn publish_batch(&self, messages: Vec<TopicMessage>) -> anyhow::Result<()> {
+        if messages.is_empty() { return Ok(()); }
+        
+        let mut groups: HashMap<String, Vec<TopicMessage>> = HashMap::new();
+        for msg in messages {
+            groups.entry(msg.topic.clone()).or_default().push(msg);
+        }
+
+        for (topic, msgs) in groups {
+            let channel = self.get_or_create_topic(topic.clone()).await;
+            
+            channel.add_to_buffer_batch(msgs.clone()).await?;
+
+            // Removed async-channel logic
+            // LRU eviction handled in add_to_buffer_batch
+        }
+        Ok(())
+    }
+
+    pub async fn get_topic_stats(&self, topic: &str) -> Option<TopicStats> {
+        let topics = self.topics.read().await;
+        if let Some(channel) = topics.get(topic) {
+            Some(channel.get_stats().await)
+        } else {
+            None
+        }
     }
 
     pub async fn subscribe(&self, topic: String) -> anyhow::Result<Subscriber> {
@@ -292,6 +436,17 @@ impl TopicManager {
         } else {
             warn!("请求的主题不存在: {} / Requested topic does not exist: {}", topic, topic);
             None
+        }
+    }
+
+    pub async fn delete_topic(&self, topic: &str) -> bool {
+        let mut topics = self.topics.write().await;
+        if topics.remove(topic).is_some() {
+            info!("删除主题: {} / Deleting topic: {}", topic, topic);
+            true
+        } else {
+            warn!("尝试删除不存在的主题: {} / Attempting to delete non-existent topic: {}", topic, topic);
+            false
         }
     }
 }

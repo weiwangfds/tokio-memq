@@ -1,6 +1,6 @@
 [package]
 name = "tokio-memq"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Simple, high-performance in-memory async message queue"
 license = "Apache-2.0"
@@ -16,6 +16,8 @@ crate-type = ["lib"]
 
 [dependencies]
 tokio = { version = "1.0", default-features = false, features = ["sync", "rt-multi-thread", "macros", "time"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 async-channel = "2.0"
 anyhow = "1.0"
@@ -31,10 +33,17 @@ bincode = "1.3"
 serde_json = "1.0"
 rmp-serde = "1.1"
 erased-serde = "0.4"
+flate2 = "1.0"
+zstd = "0.13"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tokio = { version = "1.0", default-features = false, features = ["sync", "rt-multi-thread", "macros", "time"] }
+rand = "0.9"
 
 [features]
 default = []
+
+[[bench]]
+name = "mq_benchmark"
+harness = false

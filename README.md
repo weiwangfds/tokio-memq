@@ -3,16 +3,27 @@
 [![Crates.io](https://img.shields.io/crates/v/tokio-memq.svg)](https://crates.io/crates/tokio-memq)
 [![docs.rs](https://img.shields.io/docsrs/tokio-memq)](https://docs.rs/tokio-memq)
 
-Simple, high-performance in-memory async message queue powered by Tokio.
+High-performance, feature-rich in-memory async message queue powered by Tokio. Designed for high-throughput local messaging with advanced features like backpressure, TTL, consumer groups, and pluggable serialization.
 
 ## Features
 
-- TTL: Discard expired messages on receive
-- LRU: Default-enabled eviction to prevent memory bloat
-- Consumer Groups: Offset management with `Earliest`, `Latest`, `LastOffset` (default), `Offset(n)`
-- Pluggable serialization (Bincode by default)
+- **Async & Stream API**: Built on Tokio, supporting `Stream` trait for idiomatic async consumption.
+- **Backpressure & Flow Control**: Bounded channels, LRU eviction, and lag monitoring.
+- **Advanced Consumption**:
+  - **Batch Operations**: High-throughput `publish_batch` and `recv_batch`.
+  - **Consumer Groups**: Support for `Earliest`, `Latest`, and `Offset` seeking.
+  - **Filtering**: Server-side filtering with `recv_filter`.
+  - **Manual Commit/Seek**: Precise offset control.
+- **Serialization Pipeline**:
+  - Pluggable formats (JSON, MessagePack, Bincode).
+  - Compression support (Gzip, Zstd).
+  - Per-topic and per-publisher configuration overrides.
+  - Auto-format detection via Magic Headers.
+- **Management & Monitoring**:
+  - Topic deletion and creation options (TTL, Max Messages).
+  - Real-time metrics (depth, subscriber count, lag).
 
-## Install
+## Installation
 
 Add to your `Cargo.toml`:
 
@@ -21,197 +32,209 @@ Add to your `Cargo.toml`:
 tokio-memq = "0.1"
 ```
 
-## Quick Start
+## Usage Guide
+
+### 1. Basic Publish & Subscribe
+
+The simplest way to use the queue with default settings.
 
 ```rust
-use tokio_memq::{MessageQueue, ConsumptionMode, TopicOptions};
+use tokio_memq::mq::MessageQueue;
+use tokio_memq::MessageSubscriber; // Import trait for recv()
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mq = MessageQueue::new();
-    let topic = "demo";
+    let topic = "demo_topic";
 
     // Publisher
-    let pubr = mq.publisher(topic.to_string());
-    pubr.publish_string("Hello".to_string()).await?;
+    let pub1 = mq.publisher(topic.to_string());
+    pub1.publish(&"Hello World").await?;
 
-    // Subscriber (default options)
+    // Subscriber
     let sub = mq.subscriber(topic.to_string()).await?;
     let msg = sub.recv().await?;
-    println!("Received: {}", msg.payload());
+    let payload: String = msg.deserialize()?;
+    println!("Received: {}", payload);
 
     Ok(())
 }
 ```
 
-## Consumer Groups & Offsets
+### 2. Stream API
+
+Consume messages as an async stream, ideal for continuous processing loops.
 
 ```rust
-use tokio_memq::{MessageQueue, ConsumptionMode};
+use tokio_stream::StreamExt;
+use tokio::pin;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mq = MessageQueue::new();
-    let topic = "group_demo";
-    let pubr = mq.publisher(topic.to_string());
+// Create a stream from the subscriber
+let stream = sub.stream();
+pin!(stream);
 
-    for i in 0..5 {
-        pubr.publish_string(format!("Msg {}", i)).await?;
+while let Some(msg_res) = stream.next().await {
+    match msg_res {
+        Ok(msg) => println!("Received: {:?}", msg),
+        Err(e) => eprintln!("Error: {}", e),
     }
-
-    // A: earliest
-    let sub_a = mq.subscriber_group(topic.to_string(), "g1".to_string(), ConsumptionMode::Earliest).await?;
-    let _ = sub_a.recv().await?;
-    let _ = sub_a.recv().await?;
-
-    // B: resume from last offset
-    drop(sub_a);
-    let sub_b = mq.subscriber_group(topic.to_string(), "g1".to_string(), ConsumptionMode::LastOffset).await?;
-    let next = sub_b.recv().await?;
-    assert_eq!(next.payload(), "Msg 2");
-
-    Ok(())
 }
 ```
 
-## TTL & LRU
+### 3. Batch Operations
+
+Improve throughput by processing messages in batches.
 
 ```rust
-use tokio_memq::{MessageQueue, TopicOptions};
+// Batch Publish
+let messages = vec![1, 2, 3, 4, 5];
+publisher.publish_batch(messages).await?;
+
+// Batch Receive
+// Returns a vector of up to 10 messages
+let batch = sub.recv_batch(10).await?; 
+for msg in batch {
+    println!("Batch msg: {:?}", msg);
+}
+```
+
+### 4. Advanced Consumption (Filter, Timeout, Metadata)
+
+```rust
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mq = MessageQueue::new();
-    let topic = "ttl_lru";
-
-    // TTL: 500ms
-    mq.create_topic(topic.to_string(), TopicOptions { message_ttl: Some(Duration::from_millis(500)), ..Default::default() }).await?;
-
-    let pubr = mq.publisher(topic.to_string());
-    let sub = mq.subscriber(topic.to_string()).await?;
-
-    pubr.publish_string("will expire".to_string()).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(sub.try_recv().await.is_err(), "expired should not be received");
-
-    Ok(())
+// Receive with Timeout
+match sub.recv_timeout(Duration::from_millis(500)).await? {
+    Some(msg) => println!("Got msg: {:?}", msg),
+    None => println!("Timed out"),
 }
+
+// Receive with Filter (Server-side filtering)
+// Only receive messages where payload size > 100 bytes
+let large_msg = sub.recv_filter(|msg| msg.payload.len() > 100).await?;
+
+// Metadata-only Mode (Avoids full payload clone/deserialization)
+let msg = sub.recv().await?;
+let meta = msg.metadata();
+println!("Offset: {}, Timestamp: {:?}", meta.offset, meta.created_at);
 ```
 
-## Serialization Examples
+### 5. Consumer Groups & Offsets
 
-Tokio MemQ 提供可插拔的序列化机制，默认使用 Bincode。你也可以选择 JSON、MessagePack 或注册自定义格式。
-
-### Basic: Bincode / JSON / MessagePack
+Manage offsets manually or use consumer groups for persistent state.
 
 ```rust
-use serde::{Serialize, Deserialize};
-use tokio_memq::{SerializationHelper, SerializationFormat};
+use tokio_memq::mq::{ConsumptionMode, TopicOptions};
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-struct User { id: u32, name: String }
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let u = User { id: 1, name: "alice".into() };
-
-    // Bincode
-    let bin = SerializationHelper::serialize(&u, &SerializationFormat::Bincode)?;
-    let u1: User = SerializationHelper::deserialize(&bin, &SerializationFormat::Bincode)?;
-    assert_eq!(u, u1);
-
-    // JSON
-    let json = SerializationHelper::serialize(&u, &SerializationFormat::Json)?;
-    let u2: User = SerializationHelper::deserialize(&json, &SerializationFormat::Json)?;
-    assert_eq!(u, u2);
-
-    // MessagePack
-    let msg = SerializationHelper::serialize(&u, &SerializationFormat::MessagePack)?;
-    let u3: User = SerializationHelper::deserialize(&msg, &SerializationFormat::MessagePack)?;
-    assert_eq!(u, u3);
-
-    Ok(())
-}
-```
-
-### JSON Pretty
-
-```rust
-use serde::{Serialize, Deserialize};
-use tokio_memq::{SerializationHelper, SerializationFormat};
-use tokio_memq::mq::serializer::{SerializationFactory, SerializationConfig, JsonConfig};
-
-#[derive(Serialize, Deserialize)]
-struct Item { id: u32, title: String }
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let s = SerializationFactory::create_serializer(
-        "json",
-        SerializationConfig::Json(JsonConfig { pretty: true })
-    )?;
-
-    let it = Item { id: 7, title: "doc".into() };
-    let bytes = s.serialize(&it)?; // pretty JSON
-    let txt = String::from_utf8(bytes)?;
-    assert!(txt.contains('\n'));
-
-    // 仍可用帮助器进行反序列化
-    let it2: Item = SerializationHelper::deserialize(txt.as_bytes(), &SerializationFormat::Json)?;
-    assert_eq!(it.id, it2.id);
-    Ok(())
-}
-```
-
-### Register Custom Format
-
-```rust
-use std::sync::Arc;
-use erased_serde::{Serialize as ErasedSerialize, Deserializer as ErasedDeserializer};
-use tokio_memq::mq::serializer::{
-    Serializer, Deserializer, SerializationFormat, SerializationError,
-    SerializationFactory,
+// Configure topic with retention limits
+let options = TopicOptions {
+    max_messages: Some(1000),
+    message_ttl: None, // Some(Duration::from_secs(3600))
+    lru_enabled: true,
+    ..Default::default()
 };
 
-#[derive(Default, Clone)]
-struct MyFmt;
+// Subscribe as part of a Consumer Group
+// Modes: Earliest, Latest, Offset(n), LastOffset
+let sub_group = mq.subscriber_group_with_options(
+    "topic_name".to_string(),
+    options,
+    "group_id_1".to_string(),
+    ConsumptionMode::LastOffset
+).await?;
 
-impl Serializer for MyFmt {
-    fn serialize(&self, _data: &dyn ErasedSerialize) -> Result<Vec<u8>, SerializationError> {
-        Ok(Vec::new())
-    }
-    fn format(&self) -> SerializationFormat {
-        SerializationFormat::Custom("myfmt".into())
-    }
+// Manual Commit
+let msg = sub_group.recv().await?;
+// Process message...
+sub_group.commit(msg.offset); // Save progress
+```
+
+### 6. Serialization Configuration
+
+Flexible serialization with per-topic and per-publisher overrides.
+
+**Global/Topic Defaults:**
+
+```rust
+use tokio_memq::mq::{
+    SerializationFactory, SerializationFormat, SerializationConfig, 
+    JsonConfig, PipelineConfig, CompressionConfig
+};
+
+let topic = "compressed_logs";
+
+// Configure compression pipeline
+let pipeline = PipelineConfig {
+    compression: CompressionConfig::Gzip { level: Some(6) },
+    pre: None, 
+    post: None,
+    use_magic_header: true, // Auto-detect format on receive
+};
+
+// Register defaults for a topic
+SerializationFactory::register_topic_defaults(
+    topic,
+    SerializationFormat::Json,
+    SerializationConfig::Json(JsonConfig { pretty: false }),
+    Some(pipeline),
+);
+```
+
+**Per-Publisher Overrides (Independent Keys):**
+
+```rust
+// Register specific settings for a publisher key
+SerializationFactory::register_publisher_defaults(
+    "legacy_system",
+    SerializationFormat::MessagePack,
+    SerializationConfig::Default,
+    None
+);
+
+// Create a publisher using that key
+let pub_legacy = mq.publisher_with_key(topic.to_string(), "legacy_system".to_string());
+// Messages from this publisher will use MessagePack, regardless of topic defaults
+pub_legacy.publish(&payload).await?;
+```
+
+### 7. Management & Monitoring
+
+```rust
+use tokio_memq::mq::TopicOptions;
+use std::time::Duration;
+
+// Create Topic with Options (Pre-provisioning)
+// Useful for setting TTL or max size before usage
+let options = TopicOptions {
+    max_messages: Some(5000),
+    message_ttl: Some(Duration::from_secs(3600)),
+    lru_enabled: true,
+    ..Default::default()
+};
+mq.create_topic("my_topic".to_string(), options).await?;
+
+// Get Topic Statistics
+if let Some(stats) = mq.get_topic_stats("my_topic".to_string()).await {
+    println!(
+        "Depth: {}, Subscribers: {}, Lag: {:?}", 
+        stats.message_count, 
+        stats.subscriber_count,
+        stats.consumer_lags
+    );
 }
 
-impl Deserializer for MyFmt {
-    fn with_deserializer(
-        &self,
-        _data: &[u8],
-        f: &mut dyn FnMut(&mut dyn ErasedDeserializer) -> Result<(), SerializationError>
-    ) -> Result<(), SerializationError> {
-        // 构造你的反序列化器并进行类型擦除后调用闭包
-        // let mut de = myfmt::Deserializer::new(_data);
-        // let mut erased = <dyn ErasedDeserializer>::erase(&mut de);
-        // f(&mut erased)
-        Ok(())
-    }
-    fn format(&self) -> SerializationFormat {
-        SerializationFormat::Custom("myfmt".into())
-    }
-}
+// Delete Topic
+let deleted = mq.delete_topic("my_topic").await;
+```
 
-fn main() {
-    SerializationFactory::register_serializer("myfmt", Arc::new(MyFmt::default()));
-    SerializationFactory::register_deserializer("myfmt", Arc::new(MyFmt::default()));
-}
+## Performance
+
+Run the included benchmarks to test performance on your machine:
+
+```bash
+cargo bench
 ```
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0
-- MIT license
-
-at your option.
+Apache-2.0

@@ -84,9 +84,10 @@ impl TimestampedMessage {
     /// 创建新的包装消息
     ///
     /// Create a new timestamped message.
-    pub fn new(message: TopicMessage, offset: usize) -> Self {
+    pub fn new(mut message: TopicMessage, offset: usize) -> Self {
         // 使用 TopicMessage 自带的时间戳 / Use timestamp from TopicMessage
         let created_at = message.created_at;
+        message.offset = Some(offset);
         Self {
             message,
             created_at,
@@ -100,6 +101,31 @@ impl TimestampedMessage {
     pub fn is_expired(&self, ttl: Duration) -> bool {
         self.created_at.elapsed() > ttl
     }
+
+    /// 获取消息元数据
+    ///
+    /// Get message metadata.
+    pub fn metadata(&self) -> MessageMetadata {
+        MessageMetadata {
+            topic: self.message.topic.clone(),
+            format: self.message.format.clone(),
+            created_at: self.created_at,
+            offset: self.offset,
+            payload_size: self.message.payload.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+/// 消息元数据（不含负载）
+///
+/// Message metadata (excluding payload).
+pub struct MessageMetadata {
+    pub topic: String,
+    pub format: SerializationFormat,
+    pub created_at: Instant,
+    pub offset: usize,
+    pub payload_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +138,7 @@ pub struct TopicMessage {
     pub format: SerializationFormat,
     pub payload_str: String,
     pub created_at: Instant,
+    pub offset: Option<usize>,
 }
 
 impl TopicMessage {
@@ -134,6 +161,7 @@ impl TopicMessage {
                     format,
                     payload_str,
                     created_at: Instant::now(),
+                    offset: None,
                 })
             }
             Err(e) => {
@@ -169,6 +197,7 @@ impl TopicMessage {
                     format,
                     payload_str,
                     created_at: Instant::now(),
+                    offset: None,
                 })
             }
             Err(e) => {
@@ -192,6 +221,7 @@ impl TopicMessage {
             format,
             payload_str,
             created_at: Instant::now(),
+            offset: None,
         }
     }
 
@@ -211,6 +241,7 @@ impl TopicMessage {
             format,
             payload_str: payload,
             created_at: Instant::now(),
+            offset: None,
         }
     }
 
@@ -225,6 +256,7 @@ impl TopicMessage {
             format: SerializationFormat::Bincode,
             payload_str,
             created_at: Instant::now(),
+            offset: None,
         }
     }
 
@@ -273,13 +305,6 @@ impl TopicMessage {
         &self.format
     }
 
-    /// 解析消息偏移量（示例实现）
-    ///
-    /// Parse message offset (example implementation).
-    pub fn parse_offset(&self) -> anyhow::Result<usize> {
-        Ok(self.payload.len())
-    }
-
     /// 展示负载摘要（截断以便日志输出）
     ///
     /// Display payload summary (truncated for logging).
@@ -296,5 +321,18 @@ impl TopicMessage {
             self.payload.len(),
             self.format.as_str()
         )
+    }
+
+    /// 获取消息元数据
+    ///
+    /// Get message metadata.
+    pub fn metadata(&self) -> MessageMetadata {
+        MessageMetadata {
+            topic: self.topic.clone(),
+            format: self.format.clone(),
+            created_at: self.created_at,
+            offset: self.offset.unwrap_or(0),
+            payload_size: self.payload.len(),
+        }
     }
 }

@@ -1,17 +1,19 @@
-use async_channel::Receiver;
 use std::collections::{VecDeque, HashMap};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, Notify};
 use log::{debug, info, error};
+use tokio_stream::Stream;
+use async_stream::try_stream;
 
 use crate::mq::traits::MessageSubscriber;
-use crate::mq::message::{TopicMessage, TimestampedMessage, TopicOptions, ConsumptionMode};
+use crate::mq::message::{TopicMessage, TimestampedMessage, TopicOptions, ConsumptionMode, MessageMetadata};
 use crate::mq::serializer::SerializationFormat;
 
 pub struct Subscriber {
     pub topic_name: String,
-    receiver: Arc<Mutex<Receiver<TopicMessage>>>,
+    // receiver removed
     _subscriber_count: Arc<Mutex<usize>>,
+    /// 当前消费偏移量 (Next Offset to consume)
     current_offset: Arc<Mutex<Option<usize>>>,
     message_buffer: Arc<Mutex<VecDeque<TimestampedMessage>>>,
     pub options: TopicOptions,
@@ -24,7 +26,7 @@ pub struct Subscriber {
 impl Subscriber {
     pub fn new(
         topic_name: String,
-        receiver: Arc<Mutex<Receiver<TopicMessage>>>,
+        // receiver removed
         subscriber_count: Arc<Mutex<usize>>,
         current_offset: Arc<Mutex<Option<usize>>>,
         message_buffer: Arc<Mutex<VecDeque<TimestampedMessage>>>,
@@ -36,7 +38,7 @@ impl Subscriber {
     ) -> Self {
         Subscriber {
             topic_name,
-            receiver,
+            // receiver removed
             _subscriber_count: subscriber_count,
             current_offset,
             message_buffer,
@@ -48,133 +50,137 @@ impl Subscriber {
         }
     }
 
-    async fn recv_log_based(&self, consumer_id: &str) -> anyhow::Result<TopicMessage> {
-        loop {
-            // 注册通知监听（防止检查后、等待前的竞态条件） / Register notification listener (prevent race condition between check and wait)
-            let notification = self.channel_notify.notified();
+    /// 获取当前目标偏移量
+    ///
+    /// Get current target offset.
+    async fn get_target_offset(&self) -> usize {
+        if let Some(ref id) = self.consumer_id {
+            let offsets = self.consumer_offsets.read().await;
+            *offsets.get(id).unwrap_or(&0)
+        } else {
+            let current = self.current_offset.lock().await;
+            current.unwrap_or(0)
+        }
+    }
 
-            // 获取当前需要消费的 offset / Get current offset to consume
+    /// 更新偏移量
+    ///
+    /// Advance offset.
+    async fn advance_offset(&self, new_offset: usize) {
+        if let Some(ref id) = self.consumer_id {
+            let mut offsets = self.consumer_offsets.write().await;
+            offsets.insert(id.clone(), new_offset);
+        }
+        // Update local tracking (Next Offset)
+        let mut current = self.current_offset.lock().await;
+        *current = Some(new_offset);
+    }
+
+    /// 从缓冲区获取消息
+    ///
+    /// Fetch message from buffer.
+    async fn fetch_from_buffer(&self, target_offset: usize) -> Option<TimestampedMessage> {
+        let buffer = self.message_buffer.lock().await;
+        
+        if buffer.is_empty() {
+            return None;
+        }
+
+        let last_offset = buffer.back().unwrap().offset;
+        if last_offset < target_offset {
+            return None;
+        }
+
+        let front_offset = buffer.front().unwrap().offset;
+        if target_offset < front_offset {
+            debug!("消费者落后太多 (Target: {}, Front: {})，重置为 Front / Consumer lagging too far (Target: {}, Front: {}), resetting to Front", target_offset, front_offset, target_offset, front_offset);
+            return Some(buffer.front().unwrap().clone());
+        }
+
+        for msg in buffer.iter() {
+            if msg.offset >= target_offset {
+                if let Some(ttl) = self.options.message_ttl {
+                    if msg.is_expired(ttl) {
+                        continue;
+                    }
+                }
+                return Some(msg.clone());
+            }
+        }
+        None
+    }
+
+    /// 手动提交偏移量
+    ///
+    /// Manually commit offset.
+    pub async fn commit(&self, offset: usize) -> anyhow::Result<()> {
+        self.advance_offset(offset).await;
+        Ok(())
+    }
+
+    /// 跳转到指定偏移量
+    ///
+    /// Seek to specific offset.
+    pub async fn seek(&self, offset: usize) -> anyhow::Result<()> {
+        self.commit(offset).await
+    }
+
+
+    async fn recv_metadata_log_based(&self, consumer_id: &str) -> anyhow::Result<MessageMetadata> {
+        loop {
+            let notification = self.channel_notify.notified();
             let target_offset = {
                 let offsets = self.consumer_offsets.read().await;
                 *offsets.get(consumer_id).unwrap_or(&0)
             };
 
-            // 尝试从 buffer 获取 / Try to get from buffer
-            let message_opt = {
+            let meta_opt = {
                 let buffer = self.message_buffer.lock().await;
-                
-                // 查找 >= target_offset 的第一条消息 / Find first message >= target_offset
                 if buffer.is_empty() {
-                    debug!("[Subscriber {}] Buffer empty / 缓冲区为空", consumer_id);
                     None
                 } else {
                     let last_offset = buffer.back().unwrap().offset;
                     if last_offset < target_offset {
-                        debug!("[Subscriber {}] Waiting for new message. Target: {}, Last in buffer: {} / 等待新消息...", consumer_id, target_offset, last_offset);
-                        None // 等待新消息 / Waiting for new message
+                        None
                     } else {
-                        let mut found_msg = None;
-                        
-                        // 检查是否落后太多（target_offset < front_offset） / Check if lagging too far behind (target_offset < front_offset)
+                        let mut found_meta = None;
                         let front_offset = buffer.front().unwrap().offset;
                         if target_offset < front_offset {
-                            debug!("消费者落后太多，发生越界 (Target: {}, Front: {})，重置为 Front / Consumer lagging too far, boundary crossing (Target: {}, Front: {}), resetting to Front", target_offset, front_offset, target_offset, front_offset);
-                            found_msg = Some(buffer.front().unwrap().clone());
+                             found_meta = Some(buffer.front().unwrap().metadata());
                         } else {
-                            // 正常查找 / Normal search
                             for msg in buffer.iter() {
                                 if msg.offset >= target_offset {
-                                    // 检查是否过期 / Check if expired
                                     if let Some(ttl) = self.options.message_ttl {
                                         if msg.is_expired(ttl) {
-                                            continue; // 跳过过期消息 / Skip expired message
+                                            continue;
                                         }
                                     }
-                                    found_msg = Some(msg.clone());
+                                    found_meta = Some(msg.metadata());
                                     break;
                                 }
                             }
                         }
-                        found_msg
+                        found_meta
                     }
                 }
             };
 
-            if let Some(msg) = message_opt {
-                debug!("[Subscriber {}] Found message offset: {} / 找到消息偏移量: {}", consumer_id, msg.offset, msg.offset);
-                // 更新 offset / Update offset
-                let next_offset = msg.offset + 1;
+            if let Some(meta) = meta_opt {
+                let next_offset = meta.offset + 1;
                 {
                     let mut offsets = self.consumer_offsets.write().await;
                     offsets.insert(consumer_id.to_string(), next_offset);
                 }
-                
-                // 更新 Subscriber 的 current_offset 供查询 / Update Subscriber's current_offset for query
                 let mut current_offset = self.current_offset.lock().await;
-                *current_offset = Some(msg.offset);
-
-                return Ok(msg.message);
+                *current_offset = Some(meta.offset);
+                return Ok(meta);
             } else {
-                debug!("[Subscriber {}] Waiting for notification... / 等待通知...", consumer_id);
-                // 没找到消息，等待通知 / No message found, waiting for notification
                 notification.await;
-                debug!("[Subscriber {}] Woke up from notification / 从通知中唤醒", consumer_id);
             }
         }
     }
 
-    async fn try_recv_log_based(&self, consumer_id: &str) -> anyhow::Result<TopicMessage> {
-        let target_offset = {
-            let offsets = self.consumer_offsets.read().await;
-            *offsets.get(consumer_id).unwrap_or(&0)
-        };
 
-        let message_opt = {
-            let buffer = self.message_buffer.lock().await;
-            if buffer.is_empty() {
-                None
-            } else {
-                let last_offset = buffer.back().unwrap().offset;
-                if last_offset < target_offset {
-                    None
-                } else {
-                    let mut found_msg = None;
-                    let front_offset = buffer.front().unwrap().offset;
-                    if target_offset < front_offset {
-                        found_msg = Some(buffer.front().unwrap().clone());
-                    } else {
-                        for msg in buffer.iter() {
-                            if msg.offset >= target_offset {
-                                if let Some(ttl) = self.options.message_ttl {
-                                    if msg.is_expired(ttl) {
-                                        continue;
-                                    }
-                                }
-                                found_msg = Some(msg.clone());
-                                break;
-                            }
-                        }
-                    }
-                    found_msg
-                }
-            }
-        };
-
-        if let Some(msg) = message_opt {
-            let next_offset = msg.offset + 1;
-            {
-                let mut offsets = self.consumer_offsets.write().await;
-                offsets.insert(consumer_id.to_string(), next_offset);
-            }
-            
-            let mut current_offset = self.current_offset.lock().await;
-            *current_offset = Some(msg.offset);
-
-            Ok(msg.message)
-        } else {
-            Err(anyhow::anyhow!("No message available (Log-based)"))
-        }
-    }
 }
 
 impl Subscriber {
@@ -271,101 +277,136 @@ impl Subscriber {
     }
 
     pub async fn recv_from_offset(&self, start_offset: usize) -> anyhow::Result<TopicMessage> {
-        let mut buffer = self.message_buffer.lock().await;
-        
-        while let Some(timestamped_msg) = buffer.pop_front() {
-            // 检查过期 / Check if expired
-            if let Some(ttl) = self.options.message_ttl {
-                if timestamped_msg.is_expired(ttl) {
-                    continue;
-                }
-            }
-
-            if timestamped_msg.offset >= start_offset {
-                let mut current_offset = self.current_offset.lock().await;
-                *current_offset = Some(timestamped_msg.offset);
-                
-                return Ok(timestamped_msg.message);
-            }
-        }
-        
-        Err(anyhow::anyhow!("No message found from offset {}", start_offset))
+        self.seek(start_offset).await?;
+        self.recv().await
     }
 
     pub async fn current_offset(&self) -> Option<usize> {
-        *self.current_offset.lock().await
+        if let Some(ref id) = self.consumer_id {
+            let offsets = self.consumer_offsets.read().await;
+            offsets.get(id).cloned()
+        } else {
+             *self.current_offset.lock().await
+        }
     }
 
     pub async fn reset_offset(&self) {
+        if let Some(ref id) = self.consumer_id {
+            let mut offsets = self.consumer_offsets.write().await;
+            offsets.insert(id.clone(), 0);
+        }
         let mut offset = self.current_offset.lock().await;
-        *offset = None;
+        *offset = Some(0);
     }
 
     pub fn topic(&self) -> &str {
         &self.topic_name
+    }
+
+    pub fn stream(&self) -> impl Stream<Item = anyhow::Result<TopicMessage>> + '_ {
+        try_stream! {
+            loop {
+                let msg = self.recv().await?;
+                yield msg;
+            }
+        }
+    }
+
+    pub async fn recv_timeout(&self, duration: std::time::Duration) -> anyhow::Result<Option<TopicMessage>> {
+        match tokio::time::timeout(duration, self.recv()).await {
+            Ok(res) => res.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub async fn recv_batch(&self, n: usize) -> anyhow::Result<Vec<TopicMessage>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        
+        let mut messages = Vec::with_capacity(n);
+        
+        // First message (blocking wait)
+        let first = self.recv().await?;
+        messages.push(first);
+        
+        // Subsequent messages (non-blocking)
+        for _ in 1..n {
+             match self.try_recv().await {
+                 Ok(msg) => messages.push(msg),
+                 Err(_) => break,
+             }
+        }
+        
+        Ok(messages)
+    }
+
+    pub async fn recv_filter<F>(&self, predicate: F) -> anyhow::Result<TopicMessage>
+    where F: Fn(&TopicMessage) -> bool 
+    {
+        loop {
+            let msg = self.recv().await?;
+            if predicate(&msg) {
+                return Ok(msg);
+            }
+        }
+    }
+
+    pub async fn recv_metadata(&self) -> anyhow::Result<MessageMetadata> {
+        if let Some(ref consumer_id) = self.consumer_id {
+            return self.recv_metadata_log_based(consumer_id).await;
+        }
+        
+        let msg = self.recv().await?;
+        Ok(msg.metadata())
     }
 }
 
 #[async_trait::async_trait]
 impl MessageSubscriber for Subscriber {
     async fn recv(&self) -> anyhow::Result<TopicMessage> {
-        // 如果有 consumer_id，使用基于日志的消费模式 / If consumer_id exists, use log-based consumption mode
-        if let Some(ref consumer_id) = self.consumer_id {
-            return self.recv_log_based(consumer_id).await;
-        }
-
-        let receiver = self.receiver.lock().await;
         loop {
-            let message = receiver.recv().await.map_err(|e| anyhow::anyhow!(e))?;
+            // Register notification listener before checking buffer
+            let notification = self.channel_notify.notified();
+            let target_offset = self.get_target_offset().await;
             
-            // 检查过期 / Check if expired
-            if let Some(ttl) = self.options.message_ttl {
-                if message.is_expired(ttl) {
-                    debug!("丢弃过期消息，主题: {} / Discarding expired message, topic: {}", self.topic_name, self.topic_name);
-                    continue;
-                }
+            if let Some(msg) = self.fetch_from_buffer(target_offset).await {
+                self.advance_offset(msg.offset + 1).await;
+                return Ok(msg.message);
             }
-
-            let mut offset = self.current_offset.lock().await;
-            *offset = Some(message.parse_offset()?);
             
-            return Ok(message);
+            // Wait for notification
+            notification.await;
         }
     }
 
     async fn try_recv(&self) -> anyhow::Result<TopicMessage> {
-        // 如果有 consumer_id，使用基于日志的消费模式（非阻塞） / If consumer_id exists, use log-based consumption mode (non-blocking)
-        if let Some(ref consumer_id) = self.consumer_id {
-            return self.try_recv_log_based(consumer_id).await;
-        }
-
-        let receiver = self.receiver.lock().await;
-        loop {
-            let message = receiver.try_recv().map_err(|e| anyhow::anyhow!(e))?;
-            
-            // 检查过期 / Check if expired
-            if let Some(ttl) = self.options.message_ttl {
-                if message.is_expired(ttl) {
-                    debug!("丢弃过期消息（非阻塞），主题: {} / Discarding expired message (non-blocking), topic: {}", self.topic_name, self.topic_name);
-                    // 继续尝试获取下一条 / Continue trying to get the next one
-                    continue;
-                }
-            }
-
-            let mut offset = self.current_offset.lock().await;
-            *offset = Some(message.parse_offset()?);
-            
-            return Ok(message);
+        let target_offset = self.get_target_offset().await;
+        
+        if let Some(msg) = self.fetch_from_buffer(target_offset).await {
+            self.advance_offset(msg.offset + 1).await;
+            Ok(msg.message)
+        } else {
+            Err(anyhow::anyhow!("No message available"))
         }
     }
 
     async fn current_offset(&self) -> Option<usize> {
-        *self.current_offset.lock().await
+        if let Some(ref id) = self.consumer_id {
+            let offsets = self.consumer_offsets.read().await;
+            offsets.get(id).cloned()
+        } else {
+             *self.current_offset.lock().await
+        }
     }
 
     async fn reset_offset(&self) {
+        if let Some(ref id) = self.consumer_id {
+            let mut offsets = self.consumer_offsets.write().await;
+            offsets.insert(id.clone(), 0);
+        }
         let mut offset = self.current_offset.lock().await;
-        *offset = None;
+        *offset = Some(0);
     }
 
     fn topic(&self) -> &str {

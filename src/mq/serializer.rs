@@ -9,6 +9,9 @@ use erased_serde::{Serialize as ErasedSerialize, Deserializer as ErasedDeseriali
 use std::collections::HashMap;
 use std::sync::RwLock;
 use lazy_static::lazy_static;
+use std::borrow::Cow;
+use flate2::{Compression, write::GzEncoder, bufread::GzDecoder};
+use zstd::stream::{Encoder as ZstdEncoder, Decoder as ZstdDecoder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SerializationError {
@@ -286,7 +289,6 @@ impl Deserializer for MessagePackSerializer {
     }
 }
 
-
 // --- Factory ---
 
 pub struct SerializationFactory;
@@ -294,6 +296,70 @@ pub struct SerializationFactory;
 lazy_static! {
     static ref GLOBAL_SERIALIZERS: RwLock<HashMap<String, Arc<dyn Serializer>>> = RwLock::new(HashMap::new());
     static ref GLOBAL_DESERIALIZERS: RwLock<HashMap<String, Arc<dyn Deserializer>>> = RwLock::new(HashMap::new());
+    static ref TOPIC_DEFAULTS: RwLock<HashMap<String, DefaultSettings>> = RwLock::new(HashMap::new());
+    static ref PUBLISHER_DEFAULTS: RwLock<HashMap<String, DefaultSettings>> = RwLock::new(HashMap::new());
+}
+
+#[derive(Debug, Clone)]
+pub enum CompressionConfig {
+    None,
+    Gzip { level: Option<u32> },
+    Zstd { level: i32 },
+}
+
+#[derive(Clone)]
+pub struct ProcessorPair {
+    pub encode: Arc<dyn ByteProcessor>,
+    pub decode: Arc<dyn ByteProcessor>,
+}
+
+#[derive(Clone)]
+pub struct PipelineConfig {
+    pub compression: CompressionConfig,
+    pub pre: Option<ProcessorPair>,
+    pub post: Option<ProcessorPair>,
+    pub use_magic_header: bool,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            compression: CompressionConfig::None,
+            pre: None,
+            post: None,
+            use_magic_header: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct DefaultSettings {
+    pub format: SerializationFormat,
+    pub config: SerializationConfig,
+    pub pipeline: PipelineConfig,
+}
+
+impl Default for DefaultSettings {
+    fn default() -> Self {
+        Self {
+            format: SerializationFormat::Bincode,
+            config: SerializationConfig::Default,
+            pipeline: PipelineConfig::default(),
+        }
+    }
+}
+
+pub trait ByteProcessor: Send + Sync {
+    fn process(&self, data: &[u8]) -> Result<Vec<u8>, SerializationError>;
+}
+
+#[derive(Debug)]
+pub struct NoopProcessor;
+
+impl ByteProcessor for NoopProcessor {
+    fn process(&self, data: &[u8]) -> Result<Vec<u8>, SerializationError> {
+        Ok(data.to_vec())
+    }
 }
 
 impl SerializationFactory {
@@ -352,6 +418,36 @@ impl SerializationFactory {
             _ => Err(SerializationError::ConfigInvalid(format!("Format {} does not match config or not supported for creation", format))),
         }
     }
+
+    pub fn register_topic_defaults(topic: &str, format: SerializationFormat, config: SerializationConfig, pipeline: Option<PipelineConfig>) {
+        let settings = DefaultSettings {
+            format,
+            config,
+            pipeline: pipeline.unwrap_or_default(),
+        };
+        let mut map = TOPIC_DEFAULTS.write().unwrap();
+        map.insert(topic.to_string(), settings);
+    }
+
+    pub fn register_publisher_defaults(publisher_key: &str, format: SerializationFormat, config: SerializationConfig, pipeline: Option<PipelineConfig>) {
+        let settings = DefaultSettings {
+            format,
+            config,
+            pipeline: pipeline.unwrap_or_default(),
+        };
+        let mut map = PUBLISHER_DEFAULTS.write().unwrap();
+        map.insert(publisher_key.to_string(), settings);
+    }
+
+    pub fn get_topic_defaults(topic: &str) -> Option<DefaultSettings> {
+        let map = TOPIC_DEFAULTS.read().unwrap();
+        map.get(topic).cloned()
+    }
+
+    pub fn get_publisher_defaults(publisher_key: &str) -> Option<DefaultSettings> {
+        let map = PUBLISHER_DEFAULTS.read().unwrap();
+        map.get(publisher_key).cloned()
+    }
 }
 
 // --- Helper ---
@@ -374,24 +470,43 @@ impl SerializationHelper {
         data: &[u8], 
         format: &SerializationFormat
     ) -> Result<T, SerializationError> {
-        let fmt_str = format.as_str();
+        let (raw, detected_fmt) = Self::preprocess_for_deserialize(data)?;
+        let target_format = match detected_fmt {
+            Some(df) => df,
+            None => format.clone(),
+        };
+
+        let fmt_str = target_format.as_str();
         let deserializer = SerializationFactory::get_deserializer(fmt_str)
             .ok_or_else(|| SerializationError::UnsupportedFormat(fmt_str.to_string()))?;
-            
+
         let mut obj: Option<T> = None;
-        deserializer.with_deserializer(data, &mut |erased_de| {
+        deserializer.with_deserializer(&raw, &mut |erased_de| {
             let t: T = erased_serde::deserialize(erased_de).map_err(|e| SerializationError::Custom(e.to_string()))?;
             obj = Some(t);
             Ok(())
         })?;
-        
+
         Ok(obj.expect("Deserialization closure was not called or failed silently"))
     }
     
     pub fn auto_detect_format(_data: &[u8]) -> SerializationFormat {
-        // In a real system we might check magic bytes
-        // For now default to Bincode
-        SerializationFormat::Bincode
+        if _data.len() >= 5 && &_data[0..3] == b"TMQ" {
+            let code = _data[4];
+            return match code {
+                0 => SerializationFormat::Bincode,
+                1 => SerializationFormat::Json,
+                2 => SerializationFormat::MessagePack,
+                _ => SerializationFormat::Bincode,
+            };
+        }
+        let s = String::from_utf8_lossy(_data);
+        let trimmed = s.trim_start();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            SerializationFormat::Json
+        } else {
+            SerializationFormat::Bincode
+        }
     }
     
     pub fn supported_formats() -> Vec<SerializationFormat> {
@@ -400,6 +515,101 @@ impl SerializationHelper {
             SerializationFormat::Json,
             SerializationFormat::MessagePack,
         ]
+    }
+
+    pub fn serialize_with_settings<T: Serialize>(data: &T, settings: &DefaultSettings) -> Result<Vec<u8>, SerializationError> {
+        let serializer = match SerializationFactory::create_serializer(settings.format.as_str(), settings.config.clone()) {
+            Ok(s) => s,
+            Err(_) => SerializationFactory::get_serializer(settings.format.as_str())
+                .ok_or_else(|| SerializationError::UnsupportedFormat(settings.format.as_str().to_string()))?,
+        };
+        let mut bytes = serializer.serialize(data)?;
+        if let Some(pre) = &settings.pipeline.pre {
+            bytes = pre.encode.process(&bytes)?;
+        }
+        bytes = match &settings.pipeline.compression {
+            CompressionConfig::None => bytes,
+            CompressionConfig::Gzip { level } => {
+                let mut enc = GzEncoder::new(Vec::new(), Compression::new(level.unwrap_or(6)));
+                use std::io::Write;
+                enc.write_all(&bytes).map_err(|e| SerializationError::Custom(e.to_string()))?;
+                enc.finish().map_err(|e| SerializationError::Custom(e.to_string()))?
+            }
+            CompressionConfig::Zstd { level } => {
+                let mut enc = ZstdEncoder::new(Vec::new(), *level).map_err(|e| SerializationError::Custom(e.to_string()))?;
+                use std::io::Write;
+                enc.write_all(&bytes).map_err(|e| SerializationError::Custom(e.to_string()))?;
+                enc.finish().map_err(|e| SerializationError::Custom(e.to_string()))?
+            }
+        };
+        if let Some(post) = &settings.pipeline.post {
+            bytes = post.encode.process(&bytes)?;
+        }
+        if settings.pipeline.use_magic_header {
+            let mut out = Vec::with_capacity(bytes.len() + 6);
+            out.extend_from_slice(b"TMQ");
+            out.push(1); // version
+            out.push(format_code(&settings.format));
+            out.push(compression_code(&settings.pipeline.compression));
+            out.extend_from_slice(&bytes);
+            Ok(out)
+        } else {
+            Ok(bytes)
+        }
+    }
+
+    fn preprocess_for_deserialize(data: &[u8]) -> Result<(Cow<[u8]>, Option<SerializationFormat>), SerializationError> {
+        if data.len() >= 6 && &data[0..3] == b"TMQ" {
+            let _version = data[3];
+            let fmt_code = data[4];
+            let comp_code = data[5];
+            let payload = &data[6..];
+            let mut bytes: Cow<[u8]> = Cow::Borrowed(payload);
+            bytes = match comp_code {
+                0 => bytes,
+                1 => {
+                    let mut decoder = GzDecoder::new(payload);
+                    let mut out = Vec::new();
+                    use std::io::Read;
+                    decoder.read_to_end(&mut out).map_err(|e| SerializationError::Custom(e.to_string()))?;
+                    Cow::Owned(out)
+                }
+                2 => {
+                    let mut decoder = ZstdDecoder::new(payload).map_err(|e| SerializationError::Custom(e.to_string()))?;
+                    let mut out = Vec::new();
+                    use std::io::Read;
+                    decoder.read_to_end(&mut out).map_err(|e| SerializationError::Custom(e.to_string()))?;
+                    Cow::Owned(out)
+                }
+                _ => bytes,
+            };
+            let fmt = match fmt_code {
+                0 => SerializationFormat::Bincode,
+                1 => SerializationFormat::Json,
+                2 => SerializationFormat::MessagePack,
+                _ => SerializationFormat::Bincode,
+            };
+            Ok((bytes, Some(fmt)))
+        } else {
+            Ok((Cow::Borrowed(data), None))
+        }
+    }
+}
+
+fn format_code(fmt: &SerializationFormat) -> u8 {
+    match fmt {
+        SerializationFormat::Bincode => 0,
+        SerializationFormat::Json => 1,
+        SerializationFormat::MessagePack => 2,
+        SerializationFormat::Custom(_) => 255,
+    }
+}
+
+fn compression_code(comp: &CompressionConfig) -> u8 {
+    match comp {
+        CompressionConfig::None => 0,
+        CompressionConfig::Gzip { .. } => 1,
+        CompressionConfig::Zstd { .. } => 2,
     }
 }
 
@@ -473,5 +683,33 @@ mod tests {
         }).unwrap();
         
         assert_eq!(obj.unwrap().id, 1);
+    }
+
+    #[test]
+    fn test_pipeline_gzip_magic() {
+        let data = TestData { id: 7, name: "gzip".to_string(), value: 0.5 };
+        let pipeline = PipelineConfig { compression: CompressionConfig::Gzip { level: Some(6) }, pre: None, post: None, use_magic_header: true };
+        SerializationFactory::register_topic_defaults("gzip_topic", SerializationFormat::Json, SerializationConfig::Json(JsonConfig { pretty: false }), Some(pipeline.clone()));
+        let settings = SerializationFactory::get_topic_defaults("gzip_topic").unwrap();
+        let bytes = SerializationHelper::serialize_with_settings(&data, &settings).unwrap();
+        assert_eq!(&bytes[0..3], b"TMQ");
+        let detected = SerializationHelper::auto_detect_format(&bytes);
+        assert_eq!(detected, SerializationFormat::Json);
+        let out: TestData = SerializationHelper::deserialize(&bytes, &SerializationFormat::Json).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_pipeline_zstd_magic() {
+        let data = TestData { id: 8, name: "zstd".to_string(), value: 1.5 };
+        let pipeline = PipelineConfig { compression: CompressionConfig::Zstd { level: 3 }, pre: None, post: None, use_magic_header: true };
+        SerializationFactory::register_topic_defaults("zstd_topic", SerializationFormat::MessagePack, SerializationConfig::MessagePack(MessagePackConfig { struct_map: false }), Some(pipeline.clone()));
+        let settings = SerializationFactory::get_topic_defaults("zstd_topic").unwrap();
+        let bytes = SerializationHelper::serialize_with_settings(&data, &settings).unwrap();
+        assert_eq!(&bytes[0..3], b"TMQ");
+        let detected = SerializationHelper::auto_detect_format(&bytes);
+        assert_eq!(detected, SerializationFormat::MessagePack);
+        let out: TestData = SerializationHelper::deserialize(&bytes, &SerializationFormat::MessagePack).unwrap();
+        assert_eq!(out, data);
     }
 }
