@@ -1,6 +1,6 @@
 [package]
 name = "tokio-memq"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Simple, high-performance in-memory async message queue"
 license = "Apache-2.0"
