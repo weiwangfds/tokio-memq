@@ -239,42 +239,44 @@ cargo bench
 
 ```mermaid
 flowchart LR
-    subgraph App["Application"]
-        PUB["Publisher"]
-        SUB["Subscriber"]
-    end
-    
-    MQ["MessageQueue"]
-    TM["TopicManager"]
-    TC["TopicChannel"]
-    
-    BUF["VecDeque<TimestampedMessage>"]
-    NO["watch::Sender<usize>"]
-    RX["watch::Receiver<usize>"]
-    OFF["consumer_offsets (RwLock<HashMap>)"]
-    NEXT["next_offset (AtomicUsize)"]
-    DROP["dropped_count (AtomicUsize)"]
-    TTL["TTL Cleaner (background task)"]
-    
-    SER["SerializationFactory / Pipeline"]
-    
-    PUB -->|publish()| MQ --> TM
-    TM -->|get_or_create| TC
-    TC -->|add_to_buffer / add_to_buffer_batch| BUF
-    TC --> NO
-    NO --> RX
-    SUB -->|recv()/stream()| RX
-    SUB -->|fetch_from_buffer| BUF
-    SUB -->|advance_offset| OFF
-    
-    TM -->|subscribe()| SUB
-    TC --> OFF
-    TC --> NEXT
-    TC --> DROP
-    TTL --> TC
-    
-    PUB -->|serialize| SER
-    SUB -->|deserialize| SER
+  subgraph App
+    PUB[Publisher]
+    SUB[Subscriber]
+  end
+  
+  MQ[MessageQueue]
+  TM[TopicManager]
+  TC[TopicChannel]
+  
+  BUF[Buffer - VecDeque]
+  NO[Notify Sender - watch]
+  RX[Notify Receiver - watch]
+  OFF[consumer_offsets - RwLock]
+  NEXT[next_offset - AtomicUsize]
+  DROP[dropped_count - AtomicUsize]
+  TTL[TTL Cleaner - background task]
+  
+  SER[SerializationFactory & Pipeline]
+  
+  PUB -- publish --> MQ
+  MQ --> TM
+  TM -- get_or_create --> TC
+  TC -- add_to_buffer --> BUF
+  TC -- add_to_buffer_batch --> BUF
+  TC --> NO
+  NO --> RX
+  SUB -- recv or stream --> RX
+  SUB -- fetch_from_buffer --> BUF
+  SUB -- advance_offset --> OFF
+  
+  TM -- subscribe --> SUB
+  TC --> OFF
+  TC --> NEXT
+  TC --> DROP
+  TTL --> TC
+  
+  PUB -- serialize --> SER
+  SUB -- deserialize --> SER
 ```
 
 - Data Path: `Publisher -> MessageQueue -> TopicManager -> TopicChannel -> Buffer -> Subscriber`
