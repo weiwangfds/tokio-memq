@@ -310,19 +310,31 @@ impl TopicManager {
     }
 
     pub async fn get_or_create_topic_with_options(&self, topic: String, options: TopicOptions) -> TopicChannel {
+        // Fast path: try read lock first
+        {
+            let topics = self.topics.read().await;
+            if let Some(channel) = topics.get(&topic) {
+                debug!("使用已存在的主题: {} / Using existing topic: {}", topic, topic);
+                return channel.clone();
+            }
+        } // Drop read lock
+
+        // Slow path: acquire write lock
         let mut topics = self.topics.write().await;
         
-        if !topics.contains_key(&topic) {
-            info!("创建新主题: {} / Creating new topic: {}", topic, topic);
-            debug!("主题配置: max_messages={:?}, message_ttl={:?}, lru_enabled={} / Topic config: max_messages={:?}, message_ttl={:?}, lru_enabled={}", 
-                   options.max_messages, options.message_ttl, options.lru_enabled, options.max_messages, options.message_ttl, options.lru_enabled);
-            let channel = TopicChannel::new(options);
-            topics.insert(topic.clone(), channel);
-        } else {
-            debug!("使用已存在的主题: {} / Using existing topic: {}", topic, topic);
+        // Double check
+        if let Some(channel) = topics.get(&topic) {
+             debug!("使用已存在的主题 (Double Check): {} / Using existing topic (Double Check): {}", topic, topic);
+             return channel.clone();
         }
+
+        info!("创建新主题: {} / Creating new topic: {}", topic, topic);
+        debug!("主题配置: max_messages={:?}, message_ttl={:?}, lru_enabled={} / Topic config: max_messages={:?}, message_ttl={:?}, lru_enabled={}", 
+               options.max_messages, options.message_ttl, options.lru_enabled, options.max_messages, options.message_ttl, options.lru_enabled);
+        let channel = TopicChannel::new(options);
+        topics.insert(topic.clone(), channel.clone());
         
-        topics.get(&topic).unwrap().clone()
+        channel
     }
 
     pub async fn publish(&self, message: TopicMessage) -> anyhow::Result<()> {

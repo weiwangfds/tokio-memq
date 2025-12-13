@@ -136,7 +136,6 @@ pub struct TopicMessage {
     pub topic: String,
     pub payload: Vec<u8>,
     pub format: SerializationFormat,
-    pub payload_str: String,
     pub created_at: Instant,
     pub offset: Option<usize>,
 }
@@ -151,7 +150,6 @@ impl TopicMessage {
         
         match SerializationHelper::serialize(data, &format) {
             Ok(payload) => {
-                let payload_str = String::from_utf8_lossy(&payload).to_string();
                 debug!("消息创建成功，主题: {}, 格式: {:?}, 大小: {} 字节 / Message created successfully, topic: {}, format: {:?}, size: {} bytes",
                        topic, format, payload.len(), topic, format, payload.len());
                 
@@ -159,7 +157,6 @@ impl TopicMessage {
                     topic,
                     payload,
                     format,
-                    payload_str,
                     created_at: Instant::now(),
                     offset: None,
                 })
@@ -187,7 +184,6 @@ impl TopicMessage {
         
         match SerializationHelper::serialize(data, &format) {
             Ok(payload) => {
-                let payload_str = String::from_utf8_lossy(&payload).to_string();
                 info!("消息创建成功，主题: {}, 格式: {:?}, 大小: {} 字节 / Message created successfully, topic: {}, format: {:?}, size: {} bytes", 
                       topic, format, payload.len(), topic, format, payload.len());
                 
@@ -195,7 +191,6 @@ impl TopicMessage {
                     topic,
                     payload,
                     format,
-                    payload_str,
                     created_at: Instant::now(),
                     offset: None,
                 })
@@ -214,12 +209,10 @@ impl TopicMessage {
         debug!("从字节数据创建消息，主题: {}, 格式: {:?}, 大小: {} 字节 / Creating message from bytes, topic: {}, format: {:?}, size: {} bytes", 
                topic, format, data.len(), topic, format, data.len());
         
-        let payload_str = String::from_utf8_lossy(&data).to_string();
         TopicMessage {
             topic,
             payload: data,
             format,
-            payload_str,
             created_at: Instant::now(),
             offset: None,
         }
@@ -229,7 +222,7 @@ impl TopicMessage {
     ///
     /// Create a message from serialized string (auto-detect format).
     pub fn from_serialized(topic: String, payload: String) -> Self {
-        let bytes = payload.as_bytes().to_vec();
+        let bytes = payload.into_bytes();
         let format = SerializationHelper::auto_detect_format(&bytes);
         
         debug!("从序列化字符串创建消息，主题: {}, 自动检测格式: {:?}, 大小: {} 字节 / Creating message from serialized string, topic: {}, auto-detected format: {:?}, size: {} bytes", 
@@ -239,22 +232,26 @@ impl TopicMessage {
             topic,
             payload: bytes,
             format,
-            payload_str: payload,
             created_at: Instant::now(),
             offset: None,
         }
+    }
+
+    /// 获取负载的字符串表示（有损转换）
+    ///
+    /// Get string representation of payload (lossy conversion).
+    pub fn payload_str(&self) -> std::borrow::Cow<str> {
+        String::from_utf8_lossy(&self.payload)
     }
 
     /// 创建 Bincode 格式消息
     ///
     /// Create a message in `Bincode` format.
     pub fn from_bincode(topic: String, data: Vec<u8>) -> Self {
-        let payload_str = format!("[Bincode data: {} bytes]", data.len());
         TopicMessage {
             topic,
             payload: data,
             format: SerializationFormat::Bincode,
-            payload_str,
             created_at: Instant::now(),
             offset: None,
         }
@@ -294,8 +291,8 @@ impl TopicMessage {
     /// 获取字符串负载
     ///
     /// Get payload as string.
-    pub fn payload(&self) -> &str {
-        &self.payload_str
+    pub fn payload(&self) -> std::borrow::Cow<str> {
+        self.payload_str()
     }
 
     /// 获取序列化格式
@@ -309,11 +306,11 @@ impl TopicMessage {
     ///
     /// Display payload summary (truncated for logging).
     pub fn display_payload(&self, max_len: usize) -> String {
-        let s = &self.payload_str;
+        let s = self.payload_str();
         let truncated = if s.len() > max_len {
             format!("{}...", &s[..max_len])
         } else {
-            s.clone()
+            s.into_owned()
         };
         format!(
             "{} (len={} fmt={})",

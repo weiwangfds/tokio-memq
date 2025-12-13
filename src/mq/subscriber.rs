@@ -207,7 +207,7 @@ impl Subscriber {
         
         let message = self.recv().await?;
         let payload = message.payload().to_string();
-        info!("接收到消息，主题: {}, {} / Message received, topic: {}, {}", self.topic_name, message.payload_str, self.topic_name, message.payload_str);
+        info!("接收到消息，主题: {}, {} / Message received, topic: {}, {}", self.topic_name, message.payload_str(), self.topic_name, message.payload_str());
         Ok(payload)
     }
 
