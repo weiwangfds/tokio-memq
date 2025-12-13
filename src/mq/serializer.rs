@@ -486,8 +486,7 @@ impl SerializationHelper {
             obj = Some(t);
             Ok(())
         })?;
-
-        Ok(obj.expect("Deserialization closure was not called or failed silently"))
+        obj.ok_or_else(|| SerializationError::Custom("Deserialization closure did not produce a value".to_string()))
     }
     
     pub fn auto_detect_format(_data: &[u8]) -> SerializationFormat {

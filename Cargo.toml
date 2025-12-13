@@ -39,6 +39,7 @@ env_logger = "0.11"
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tokio = { version = "1.0", default-features = false, features = ["sync", "rt-multi-thread", "macros", "time"] }
 rand = "0.9"
+sysinfo = "0.36.1"
 
 [features]
 default = []

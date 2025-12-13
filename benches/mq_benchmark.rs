@@ -3,6 +3,18 @@ use tokio::runtime::Runtime;
 use tokio_memq::mq::MessageQueue;
 use tokio_memq::MessageSubscriber;
 use tokio_stream::StreamExt;
+use sysinfo::{System, Pid};
+
+fn get_memory_usage() -> u64 {
+    let mut system = System::new();
+    system.refresh_all();
+    let pid = Pid::from_u32(std::process::id());
+    if let Some(process) = system.process(pid) {
+        process.memory() // Returns memory usage in KB
+    } else {
+        0
+    }
+}
 
 async fn publish_individual(mq: &MessageQueue, topic: &str, count: usize) {
     let publisher = mq.publisher(topic.to_string());
@@ -92,34 +104,76 @@ async fn consume_concurrent_fanout(mq: &MessageQueue, topic: &str, num_subs: usi
     }
 }
 
+async fn run_stream_backpressure_test(mq: MessageQueue, topic: String, count: usize) {
+    // Start measuring memory
+    let start_mem = get_memory_usage();
+    println!("Start memory: {} KB", start_mem);
+
+    // 1. Publish messages rapidly
+    let publisher = mq.publisher(topic.clone());
+    
+    // Spawn publisher
+    let pub_handle = tokio::spawn(async move {
+        for i in 0..count {
+            publisher.publish(&i).await.unwrap();
+        }
+    });
+
+    // 2. Consume slowly using stream
+    let mq_sub = mq.clone();
+    let topic_sub = topic.clone();
+    let sub_handle = tokio::spawn(async move {
+        let subscriber = mq_sub.subscriber(topic_sub).await.unwrap();
+        let stream = subscriber.stream(); 
+        tokio::pin!(stream);
+
+        let mut consumed = 0;
+        while let Some(_) = stream.next().await {
+            consumed += 1;
+            if consumed % 1000 == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await; // Slow down
+            }
+            if consumed >= count {
+                break;
+            }
+        }
+    });
+
+    // Monitor memory during execution
+    let monitor_handle = tokio::spawn(async move {
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // let current_mem = get_memory_usage();
+            // println!("Current memory: {} KB", current_mem); 
+        }
+    });
+
+    let _ = tokio::join!(pub_handle, sub_handle, monitor_handle);
+    
+    let end_mem = get_memory_usage();
+    println!("End memory: {} KB, Diff: {} KB", end_mem, end_mem as i64 - start_mem as i64);
+}
+
 fn bench_concurrent(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    // We need an Arc<MessageQueue> to share across potential spawns if needed, but here we spawn with moved components.
-    // MessageQueue itself:
-    // pub struct MessageQueue { topic_manager: TopicManager }
-    // TopicManager is Clone (Arc internally).
-    // So MessageQueue should be Clone-able if we derive it? 
-    // Let's assume we can't Clone MessageQueue easily without checking.
-    // But `publish_concurrent` takes `&MessageQueue` and creates publishers.
-    
     let mq = MessageQueue::new();
     let count = 1000;
     let concurrency = 4;
 
     let mut group = c.benchmark_group("Concurrent");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_secs(1));
 
-    group.bench_function(BenchmarkId::new("Publish_4x250", count), |b| {
+    group.bench_function(BenchmarkId::new("Publish_4x250k", count), |b| {
         b.to_async(&rt).iter(|| async {
             let topic = format!("con_pub_{}", rand::random::<u32>());
-            // 4 tasks, each 250 messages = 1000 total
             publish_concurrent(&mq, &topic, concurrency, count / concurrency).await;
         })
     });
 
-    group.bench_function(BenchmarkId::new("Fanout_4x1000", count), |b| {
+    group.bench_function(BenchmarkId::new("Fanout_4x1M", count), |b| {
         b.to_async(&rt).iter(|| async {
             let topic = format!("con_sub_{}", rand::random::<u32>());
-            // 4 subscribers, each consumes ALL 1000 messages (Fanout)
             consume_concurrent_fanout(&mq, &topic, concurrency, count).await;
         })
     });
@@ -133,6 +187,8 @@ fn bench_publish(c: &mut Criterion) {
     let count = 1000;
 
     let mut group = c.benchmark_group("Publish");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_secs(1));
     
     group.bench_function(BenchmarkId::new("Individual", count), |b| {
         b.to_async(&rt).iter(|| async {
@@ -154,9 +210,11 @@ fn bench_publish(c: &mut Criterion) {
 fn bench_consume(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mq = MessageQueue::new();
-    let count = 1000;
+    let count = 1_000;
 
     let mut group = c.benchmark_group("Consume");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_secs(1));
 
     group.bench_function(BenchmarkId::new("Individual", count), |b| {
         b.to_async(&rt).iter(|| async {
@@ -175,5 +233,31 @@ fn bench_consume(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_publish, bench_consume, bench_concurrent);
+fn bench_backpressure(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mq = MessageQueue::new();
+    let count = 1000; // Reduce count for repetitive benchmark
+
+    let mut group = c.benchmark_group("Backpressure");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+
+    group.bench_function(BenchmarkId::new("Stream_SlowConsumer", count), |b| {
+        b.to_async(&rt).iter_custom(|iters| {
+            let mq = mq.clone();
+            async move {
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    let topic = format!("bp_stream_{}", rand::random::<u32>());
+                    run_stream_backpressure_test(mq.clone(), topic, count).await;
+                }
+                start.elapsed()
+            }
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_publish, bench_consume, bench_concurrent, bench_backpressure);
 criterion_main!(benches);

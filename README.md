@@ -235,6 +235,54 @@ Run the included benchmarks to test performance on your machine:
 cargo bench
 ```
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph App["Application"]
+        PUB["Publisher"]
+        SUB["Subscriber"]
+    end
+    
+    MQ["MessageQueue"]
+    TM["TopicManager"]
+    TC["TopicChannel"]
+    
+    BUF["VecDeque<TimestampedMessage>"]
+    NO["watch::Sender<usize>"]
+    RX["watch::Receiver<usize>"]
+    OFF["consumer_offsets (RwLock<HashMap>)"]
+    NEXT["next_offset (AtomicUsize)"]
+    DROP["dropped_count (AtomicUsize)"]
+    TTL["TTL Cleaner (background task)"]
+    
+    SER["SerializationFactory / Pipeline"]
+    
+    PUB -->|publish()| MQ --> TM
+    TM -->|get_or_create| TC
+    TC -->|add_to_buffer / add_to_buffer_batch| BUF
+    TC --> NO
+    NO --> RX
+    SUB -->|recv()/stream()| RX
+    SUB -->|fetch_from_buffer| BUF
+    SUB -->|advance_offset| OFF
+    
+    TM -->|subscribe()| SUB
+    TC --> OFF
+    TC --> NEXT
+    TC --> DROP
+    TTL --> TC
+    
+    PUB -->|serialize| SER
+    SUB -->|deserialize| SER
+```
+
+- Data Path: `Publisher -> MessageQueue -> TopicManager -> TopicChannel -> Buffer -> Subscriber`
+- Flow Control: `watch::Sender/Receiver` used for notification; `max_messages` and TTL enforce retention; LRU via front eviction
+- Offsets: `next_offset` atomically allocates; consumer group offsets stored in `RwLock<HashMap>`
+- Serialization: Pluggable formats and compression via `SerializationFactory` and `PipelineConfig`
+- Maintenance: Background TTL cleaner periodically removes expired messages from each topic
+
 ## License
 
 Apache-2.0

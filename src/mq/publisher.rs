@@ -46,7 +46,8 @@ impl Publisher {
             TopicMessage::new(self.topic.clone(), data)?
         };
         debug!("消息创建成功，格式: {:?}, 大小: {} 字节 / Message created successfully, format: {:?}, size: {} bytes", message.format, message.payload.len(), message.format, message.payload.len());
-        info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, message.payload_str(), self.topic, message.payload_str());
+        let summary = message.display_payload(256);
+        info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, summary, self.topic, summary);
         
         self.topic_manager.publish(message).await
     }
@@ -58,7 +59,8 @@ impl Publisher {
         debug!("发布已序列化的字符串数据到主题: {}, 大小: {} 字节 / Publishing serialized string data to topic: {}, size: {} bytes", self.topic, payload.len(), self.topic, payload.len());
         
         let message = TopicMessage::from_serialized(self.topic.clone(), payload);
-        info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, message.payload_str(), self.topic, message.payload_str());
+        let summary = message.display_payload(256);
+        info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, summary, self.topic, summary);
         self.topic_manager.publish(message).await
     }
 
@@ -81,7 +83,8 @@ impl Publisher {
         
         let message = TopicMessage::new_with_format(self.topic.clone(), data, format)?;
         debug!("消息序列化完成，格式: {:?}, 大小: {} 字节 / Message serialization completed, format: {:?}, size: {} bytes", message.format, message.payload.len(), message.format, message.payload.len());
-        info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, message.payload_str(), self.topic, message.payload_str());
+        let summary = message.display_payload(256);
+        info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, summary, self.topic, summary);
         
         self.topic_manager.publish(message).await
     }
@@ -98,7 +101,8 @@ impl Publisher {
     /// Publish raw bytes with specified `SerializationFormat`.
     pub async fn publish_bytes(&self, data: Vec<u8>, format: SerializationFormat) -> anyhow::Result<()> {
         let message = TopicMessage::from_bytes(self.topic.clone(), data, format);
-        info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, message.payload_str(), self.topic, message.payload_str());
+        let summary = message.display_payload(256);
+        info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, summary, self.topic, summary);
         self.topic_manager.publish(message).await
     }
 

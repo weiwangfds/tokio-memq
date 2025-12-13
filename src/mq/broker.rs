@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use tokio::sync::{RwLock, Mutex, Notify};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use tokio::sync::{RwLock, Mutex, watch};
 use log::{debug, info, warn, trace};
 
 use crate::mq::traits::QueueManager;
@@ -23,31 +23,31 @@ pub struct TopicManager {
 
 #[derive(Clone)]
 pub struct TopicChannel {
-    subscriber_count: Arc<Mutex<usize>>,
+    subscriber_count: Arc<AtomicUsize>,
     options: TopicOptions,
-    message_buffer: Arc<Mutex<VecDeque<TimestampedMessage>>>,
-    next_offset: Arc<Mutex<usize>>,
+    message_buffer: Arc<RwLock<VecDeque<TimestampedMessage>>>,
+    next_offset: Arc<AtomicUsize>,
     consumer_offsets: Arc<RwLock<HashMap<String, usize>>>,
-    notify: Arc<Notify>,
-    dropped_count: Arc<Mutex<usize>>,
+    notify: Arc<watch::Sender<usize>>,
+    dropped_count: Arc<AtomicUsize>,
 }
 
 impl TopicChannel {
     pub fn new(options: TopicOptions) -> Self {
+        let (tx, _) = watch::channel(0);
         TopicChannel {
-            subscriber_count: Arc::new(Mutex::new(0)),
+            subscriber_count: Arc::new(AtomicUsize::new(0)),
             options,
-            message_buffer: Arc::new(Mutex::new(VecDeque::new())),
-            next_offset: Arc::new(Mutex::new(0)),
+            message_buffer: Arc::new(RwLock::new(VecDeque::new())),
+            next_offset: Arc::new(AtomicUsize::new(0)),
             consumer_offsets: Arc::new(RwLock::new(HashMap::new())),
-            notify: Arc::new(Notify::new()),
-            dropped_count: Arc::new(Mutex::new(0)),
+            notify: Arc::new(tx),
+            dropped_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub async fn add_subscriber(&self, consumer_id: Option<String>, mode: ConsumptionMode) -> Subscriber {
-        let mut count = self.subscriber_count.lock().await;
-        *count += 1;
+        self.subscriber_count.fetch_add(1, Ordering::SeqCst);
 
         // 如果指定了消费者 ID，初始化偏移量 / If consumer ID is specified, initialize offset
         let mut start_offset_local = 0;
@@ -62,7 +62,7 @@ impl TopicChannel {
             if !has_offset {
                 let mut offsets = self.consumer_offsets.write().await;
                 if !offsets.contains_key(id) {
-                    let buffer = self.message_buffer.lock().await;
+                    let buffer = self.message_buffer.read().await;
                     let start_offset = match mode {
                         ConsumptionMode::Earliest => {
                             buffer.front().map(|m| m.offset).unwrap_or(0)
@@ -90,7 +90,7 @@ impl TopicChannel {
             }
         } else {
             // 无 ID 订阅者，仅在本地维护偏移量 / Subscriber without ID, maintain offset locally
-             let buffer = self.message_buffer.lock().await;
+             let buffer = self.message_buffer.read().await;
              start_offset_local = match mode {
                 ConsumptionMode::Earliest => {
                     buffer.front().map(|m| m.offset).unwrap_or(0)
@@ -116,13 +116,13 @@ impl TopicChannel {
             consumer_id,
             mode,
             Arc::clone(&self.consumer_offsets),
-            Arc::clone(&self.notify),
+            self.notify.subscribe(),
         )
     }
 
     pub async fn cleanup_expired_messages(&self) {
         if let Some(ttl) = self.options.message_ttl {
-            let mut buffer = self.message_buffer.lock().await;
+            let mut buffer = self.message_buffer.write().await;
             let mut dropped = 0;
             while let Some(msg) = buffer.front() {
                 if msg.is_expired(ttl) {
@@ -133,21 +133,18 @@ impl TopicChannel {
                 }
             }
             if dropped > 0 {
-                let mut dropped_lock = self.dropped_count.lock().await;
-                *dropped_lock += dropped;
+                self.dropped_count.fetch_add(dropped, Ordering::SeqCst);
             }
         }
     }
 
     pub async fn add_to_buffer(&self, message: TopicMessage) -> anyhow::Result<()> {
-        let mut offset_lock = self.next_offset.lock().await;
-        let current_offset = *offset_lock;
-        *offset_lock += 1;
-        drop(offset_lock);
+        let current_offset = self.next_offset.fetch_add(1, Ordering::SeqCst);
+        let next_val = current_offset + 1;
         
         let timestamped_msg = TimestampedMessage::new(message, current_offset);
         
-        let mut buffer = self.message_buffer.lock().await;
+        let mut buffer = self.message_buffer.write().await;
         let mut dropped = 0;
         
         if let Some(ttl) = self.options.message_ttl {
@@ -169,13 +166,12 @@ impl TopicChannel {
         }
         
         if dropped > 0 {
-            let mut dropped_lock = self.dropped_count.lock().await;
-            *dropped_lock += dropped;
+            self.dropped_count.fetch_add(dropped, Ordering::SeqCst);
         }
 
         buffer.push_back(timestamped_msg);
         // 通知等待的订阅者 / Notify waiting subscribers
-        self.notify.notify_waiters();
+        self.notify.send(next_val).ok();
         Ok(())
     }
 
@@ -183,12 +179,10 @@ impl TopicChannel {
         let count = messages.len();
         if count == 0 { return Ok(()); }
 
-        let mut offset_lock = self.next_offset.lock().await;
-        let start_offset = *offset_lock;
-        *offset_lock += count;
-        drop(offset_lock);
+        let start_offset = self.next_offset.fetch_add(count, Ordering::SeqCst);
+        let next_val = start_offset + count;
         
-        let mut buffer = self.message_buffer.lock().await;
+        let mut buffer = self.message_buffer.write().await;
         let mut dropped = 0;
         
         // 清理过期消息 / Clean expired messages
@@ -245,23 +239,22 @@ impl TopicChannel {
         }
         
         if dropped > 0 {
-            let mut dropped_lock = self.dropped_count.lock().await;
-            *dropped_lock += dropped;
+            self.dropped_count.fetch_add(dropped, Ordering::SeqCst);
         }
 
-        self.notify.notify_waiters();
+        self.notify.send(next_val).ok();
         Ok(())
     }
 
     pub async fn get_stats(&self) -> TopicStats {
-        let buffer = self.message_buffer.lock().await;
+        let buffer = self.message_buffer.read().await;
         let message_count = buffer.len();
-        let subscriber_count = *self.subscriber_count.lock().await;
-        let dropped_messages = *self.dropped_count.lock().await;
+        let subscriber_count = self.subscriber_count.load(Ordering::SeqCst);
+        let dropped_messages = self.dropped_count.load(Ordering::SeqCst);
         
         let mut consumer_lags = HashMap::new();
         let offsets = self.consumer_offsets.read().await;
-        let next_offset = *self.next_offset.lock().await;
+        let next_offset = self.next_offset.load(Ordering::SeqCst);
         
         for (id, offset) in offsets.iter() {
             let lag = if next_offset >= *offset {
@@ -281,7 +274,7 @@ impl TopicChannel {
     }
 
     pub async fn get_valid_message(&self) -> Option<TopicMessage> {
-        let mut buffer = self.message_buffer.lock().await;
+        let mut buffer = self.message_buffer.write().await;
         
         while let Some(timestamped_msg) = buffer.pop_front() {
             if let Some(ttl) = self.options.message_ttl {
@@ -301,7 +294,20 @@ impl TopicManager {
     pub fn new() -> Self {
         debug!("创建新的主题管理器 / Creating new topic manager");
         trace!("初始化主题管理器完成 / Topic manager initialization completed");
-        let topics = Arc::new(RwLock::new(HashMap::new()));
+        let topics: Arc<RwLock<HashMap<String, TopicChannel>>> = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let topics_clone = Arc::clone(&topics);
+            tokio::spawn(async move {
+                let interval = std::time::Duration::from_millis(200);
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let topics_map = topics_clone.read().await;
+                    for (_name, channel) in topics_map.iter() {
+                        channel.cleanup_expired_messages().await;
+                    }
+                }
+            });
+        }
         TopicManager { topics }
     }
 
@@ -364,7 +370,7 @@ impl TopicManager {
         for (topic, msgs) in groups {
             let channel = self.get_or_create_topic(topic.clone()).await;
             
-            channel.add_to_buffer_batch(msgs.clone()).await?;
+            channel.add_to_buffer_batch(msgs).await?;
 
             // Removed async-channel logic
             // LRU eviction handled in add_to_buffer_batch
@@ -387,8 +393,8 @@ impl TopicManager {
         let mut subscriber = channel.add_subscriber(None, ConsumptionMode::default()).await;
         subscriber.topic_name = topic;
         
-        let count = channel.subscriber_count.lock().await;
-        debug!("主题订阅成功，当前订阅者数量: {} / Topic subscription successful, current subscriber count: {}", *count, *count);
+        let count = channel.subscriber_count.load(Ordering::SeqCst);
+        debug!("主题订阅成功，当前订阅者数量: {} / Topic subscription successful, current subscriber count: {}", count, count);
         Ok(subscriber)
     }
 
@@ -398,8 +404,8 @@ impl TopicManager {
         let mut subscriber = channel.add_subscriber(Some(consumer_id), mode).await;
         subscriber.topic_name = topic;
         
-        let count = channel.subscriber_count.lock().await;
-        debug!("主题订阅成功（消费者组），当前订阅者数量: {} / Topic subscription successful (consumer group), current subscriber count: {}", *count, *count);
+        let count = channel.subscriber_count.load(Ordering::SeqCst);
+        debug!("主题订阅成功（消费者组），当前订阅者数量: {} / Topic subscription successful (consumer group), current subscriber count: {}", count, count);
         Ok(subscriber)
     }
 
@@ -413,8 +419,8 @@ impl TopicManager {
         subscriber.topic_name = topic;
         subscriber.options = options;
         
-        let count = channel.subscriber_count.lock().await;
-        debug!("主题订阅成功（带选项），当前订阅者数量: {} / Topic subscription successful (with options), current subscriber count: {}", *count, *count);
+        let count = channel.subscriber_count.load(Ordering::SeqCst);
+        debug!("主题订阅成功（带选项），当前订阅者数量: {} / Topic subscription successful (with options), current subscriber count: {}", count, count);
         Ok(subscriber)
     }
 
@@ -426,8 +432,8 @@ impl TopicManager {
         subscriber.topic_name = topic;
         subscriber.options = options;
         
-        let count = channel.subscriber_count.lock().await;
-        debug!("主题订阅成功（带选项和组），当前订阅者数量: {} / Topic subscription successful (with options and group), current subscriber count: {}", *count, *count);
+        let count = channel.subscriber_count.load(Ordering::SeqCst);
+        debug!("主题订阅成功（带选项和组），当前订阅者数量: {} / Topic subscription successful (with options and group), current subscriber count: {}", count, count);
         Ok(subscriber)
     }
 
@@ -441,8 +447,7 @@ impl TopicManager {
     pub async fn get_subscriber_count(&self, topic: &str) -> Option<usize> {
         let topics = self.topics.read().await;
         if let Some(channel) = topics.get(topic) {
-            let count = channel.subscriber_count.lock().await;
-            let count_val = *count;
+            let count_val = channel.subscriber_count.load(Ordering::SeqCst);
             debug!("主题 {} 的订阅者数量: {} / Subscriber count for topic {}: {}", topic, count_val, topic, count_val);
             Some(count_val)
         } else {

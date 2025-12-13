@@ -1,6 +1,6 @@
 use std::collections::{VecDeque, HashMap};
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, Notify};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use tokio::sync::{Mutex, RwLock, watch};
 use log::{debug, info, error};
 use tokio_stream::Stream;
 use async_stream::try_stream;
@@ -12,29 +12,29 @@ use crate::mq::serializer::SerializationFormat;
 pub struct Subscriber {
     pub topic_name: String,
     // receiver removed
-    _subscriber_count: Arc<Mutex<usize>>,
+    _subscriber_count: Arc<AtomicUsize>,
     /// 当前消费偏移量 (Next Offset to consume)
     current_offset: Arc<Mutex<Option<usize>>>,
-    message_buffer: Arc<Mutex<VecDeque<TimestampedMessage>>>,
+    message_buffer: Arc<RwLock<VecDeque<TimestampedMessage>>>,
     pub options: TopicOptions,
     pub consumer_id: Option<String>,
     pub consumption_mode: ConsumptionMode,
     consumer_offsets: Arc<RwLock<HashMap<String, usize>>>,
-    channel_notify: Arc<Notify>,
+    channel_notify: watch::Receiver<usize>,
 }
 
 impl Subscriber {
     pub fn new(
         topic_name: String,
         // receiver removed
-        subscriber_count: Arc<Mutex<usize>>,
+        subscriber_count: Arc<AtomicUsize>,
         current_offset: Arc<Mutex<Option<usize>>>,
-        message_buffer: Arc<Mutex<VecDeque<TimestampedMessage>>>,
+        message_buffer: Arc<RwLock<VecDeque<TimestampedMessage>>>,
         options: TopicOptions,
         consumer_id: Option<String>,
         consumption_mode: ConsumptionMode,
         consumer_offsets: Arc<RwLock<HashMap<String, usize>>>,
-        channel_notify: Arc<Notify>,
+        channel_notify: watch::Receiver<usize>,
     ) -> Self {
         Subscriber {
             topic_name,
@@ -80,29 +80,41 @@ impl Subscriber {
     ///
     /// Fetch message from buffer.
     async fn fetch_from_buffer(&self, target_offset: usize) -> Option<TimestampedMessage> {
-        let buffer = self.message_buffer.lock().await;
-        
-        if buffer.is_empty() {
-            return None;
-        }
-
+        let buffer = self.message_buffer.read().await;
+        if buffer.is_empty() { return None; }
         let last_offset = buffer.back().unwrap().offset;
-        if last_offset < target_offset {
-            return None;
-        }
-
+        if last_offset < target_offset { return None; }
         let front_offset = buffer.front().unwrap().offset;
         if target_offset < front_offset {
-            debug!("消费者落后太多 (Target: {}, Front: {})，重置为 Front / Consumer lagging too far (Target: {}, Front: {}), resetting to Front", target_offset, front_offset, target_offset, front_offset);
-            return Some(buffer.front().unwrap().clone());
+            for msg in buffer.iter() {
+                if let Some(ttl) = self.options.message_ttl {
+                    if msg.is_expired(ttl) { continue; }
+                }
+                return Some(msg.clone());
+            }
+            return None;
         }
-
-        for msg in buffer.iter() {
+        let idx = (target_offset - front_offset) as usize;
+        if let Some(msg) = buffer.get(idx) {
+            if let Some(ttl) = self.options.message_ttl {
+                if msg.is_expired(ttl) {
+                    for msg2 in buffer.iter().skip(idx + 1) {
+                        if msg2.offset >= target_offset {
+                            if let Some(ttl) = self.options.message_ttl {
+                                if msg2.is_expired(ttl) { continue; }
+                            }
+                            return Some(msg2.clone());
+                        }
+                    }
+                    return None;
+                }
+            }
+            return Some(msg.clone());
+        }
+        for msg in buffer.iter().skip(idx) {
             if msg.offset >= target_offset {
                 if let Some(ttl) = self.options.message_ttl {
-                    if msg.is_expired(ttl) {
-                        continue;
-                    }
+                    if msg.is_expired(ttl) { continue; }
                 }
                 return Some(msg.clone());
             }
@@ -128,14 +140,14 @@ impl Subscriber {
 
     async fn recv_metadata_log_based(&self, consumer_id: &str) -> anyhow::Result<MessageMetadata> {
         loop {
-            let notification = self.channel_notify.notified();
+            let mut rx = self.channel_notify.clone();
             let target_offset = {
                 let offsets = self.consumer_offsets.read().await;
                 *offsets.get(consumer_id).unwrap_or(&0)
             };
 
             let meta_opt = {
-                let buffer = self.message_buffer.lock().await;
+                let buffer = self.message_buffer.read().await;
                 if buffer.is_empty() {
                     None
                 } else {
@@ -146,7 +158,15 @@ impl Subscriber {
                         let mut found_meta = None;
                         let front_offset = buffer.front().unwrap().offset;
                         if target_offset < front_offset {
-                             found_meta = Some(buffer.front().unwrap().metadata());
+                             for msg in buffer.iter() {
+                                 if let Some(ttl) = self.options.message_ttl {
+                                     if msg.is_expired(ttl) {
+                                         continue;
+                                     }
+                                 }
+                                 found_meta = Some(msg.metadata());
+                                 break;
+                             }
                         } else {
                             for msg in buffer.iter() {
                                 if msg.offset >= target_offset {
@@ -175,7 +195,9 @@ impl Subscriber {
                 *current_offset = Some(meta.offset);
                 return Ok(meta);
             } else {
-                notification.await;
+                if rx.changed().await.is_err() {
+                    return Err(anyhow::anyhow!("Topic closed"));
+                }
             }
         }
     }
@@ -362,12 +384,17 @@ impl Subscriber {
     }
 }
 
+impl Drop for Subscriber {
+    fn drop(&mut self) {
+        self._subscriber_count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 #[async_trait::async_trait]
 impl MessageSubscriber for Subscriber {
     async fn recv(&self) -> anyhow::Result<TopicMessage> {
         loop {
             // Register notification listener before checking buffer
-            let notification = self.channel_notify.notified();
+            let mut rx = self.channel_notify.clone();
             let target_offset = self.get_target_offset().await;
             
             if let Some(msg) = self.fetch_from_buffer(target_offset).await {
@@ -376,7 +403,9 @@ impl MessageSubscriber for Subscriber {
             }
             
             // Wait for notification
-            notification.await;
+            if rx.changed().await.is_err() {
+                 return Err(anyhow::anyhow!("Topic closed"));
+            }
         }
     }
 
