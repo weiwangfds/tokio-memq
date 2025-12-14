@@ -59,8 +59,11 @@ impl SerializationFormat {
             SerializationFormat::Custom(s) => s,
         }
     }
-    
-    pub fn from_str(s: &str) -> Result<Self, SerializationError> {
+}
+
+impl std::str::FromStr for SerializationFormat {
+    type Err = SerializationError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "bincode" | "binary" => Ok(SerializationFormat::Bincode),
             "json" => Ok(SerializationFormat::Json),
@@ -71,39 +74,21 @@ impl SerializationFormat {
 }
 
 /// Configuration for Bincode serialization
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BincodeConfig {
     // We stick to standard options for now
 }
 
-impl Default for BincodeConfig {
-    fn default() -> Self {
-        Self {}
-    }
-}
-
 /// Configuration for JSON serialization
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct JsonConfig {
     pub pretty: bool,
 }
 
-impl Default for JsonConfig {
-    fn default() -> Self {
-        Self { pretty: false }
-    }
-}
-
 /// Configuration for MessagePack serialization
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MessagePackConfig {
     pub struct_map: bool,
-}
-
-impl Default for MessagePackConfig {
-    fn default() -> Self {
-        Self { struct_map: false }
-    }
 }
 
 #[derive(Debug, Clone)]

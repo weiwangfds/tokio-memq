@@ -24,6 +24,7 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         topic_name: String,
         // receiver removed
@@ -94,7 +95,7 @@ impl Subscriber {
             }
             return None;
         }
-        let idx = (target_offset - front_offset) as usize;
+        let idx = target_offset - front_offset;
         if let Some(msg) = buffer.get(idx) {
             if let Some(ttl) = self.options.message_ttl {
                 if msg.is_expired(ttl) {
@@ -194,10 +195,8 @@ impl Subscriber {
                 let mut current_offset = self.current_offset.lock().await;
                 *current_offset = Some(meta.offset);
                 return Ok(meta);
-            } else {
-                if rx.changed().await.is_err() {
-                    return Err(anyhow::anyhow!("Topic closed"));
-                }
+            } else if rx.changed().await.is_err() {
+                return Err(anyhow::anyhow!("Topic closed"));
             }
         }
     }

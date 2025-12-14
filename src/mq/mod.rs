@@ -76,6 +76,13 @@ impl MessageQueue {
     pub async fn subscriber_with_options(&self, topic: String, options: TopicOptions) -> anyhow::Result<Subscriber> {
         self.topic_manager.subscribe_with_options(topic, options).await
     }
+    
+    /// 订阅指定主题（自定义 TopicOptions 且指定消费模式）
+    ///
+    /// Subscribe to a topic with custom `TopicOptions` and `ConsumptionMode`.
+    pub async fn subscriber_with_options_and_mode(&self, topic: String, options: TopicOptions, mode: ConsumptionMode) -> anyhow::Result<Subscriber> {
+        self.topic_manager.subscribe_with_options_and_mode(topic, options, mode).await
+    }
 
     /// 按消费者组 ID 订阅主题（支持偏移量模式）
     ///

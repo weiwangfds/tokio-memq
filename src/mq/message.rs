@@ -41,7 +41,7 @@ impl Default for TopicOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 /// 消费模式
 ///
 /// Consumption mode.
@@ -61,13 +61,8 @@ pub enum ConsumptionMode {
     /// 从上次提交的偏移量继续（默认）
     ///
     /// Continue from the last committed offset (default).
+    #[default]
     LastOffset,
-}
-
-impl Default for ConsumptionMode {
-    fn default() -> Self {
-        ConsumptionMode::LastOffset
-    }
 }
 
 #[derive(Debug, Clone)]

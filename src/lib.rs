@@ -214,6 +214,11 @@
 //! ```
 
 pub mod mq;
+pub mod tcp {
+    pub mod protocol;
+    pub mod server;
+    pub mod client;
+}
 
 pub use mq::traits::{MessagePublisher, AsyncMessagePublisher, MessageSubscriber, QueueManager};
 pub use mq::message::{TopicMessage, TopicOptions, TimestampedMessage, ConsumptionMode};

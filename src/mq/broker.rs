@@ -257,11 +257,7 @@ impl TopicChannel {
         let next_offset = self.next_offset.load(Ordering::SeqCst);
         
         for (id, offset) in offsets.iter() {
-            let lag = if next_offset >= *offset {
-                next_offset - *offset
-            } else {
-                0
-            };
+            let lag = next_offset.saturating_sub(*offset);
             consumer_lags.insert(id.clone(), lag);
         }
 
@@ -424,6 +420,21 @@ impl TopicManager {
         Ok(subscriber)
     }
 
+    pub async fn subscribe_with_options_and_mode(&self, topic: String, options: TopicOptions, mode: ConsumptionMode) -> anyhow::Result<Subscriber> {
+        info!("创建带选项的订阅者（含模式），主题: {} / Creating subscriber with options and mode, topic: {}", topic, topic);
+        debug!("订阅选项: max_messages={:?}, message_ttl={:?}, lru_enabled={}, 模式: {:?} / Subscription options: max_messages={:?}, message_ttl={:?}, lru_enabled={}, mode: {:?}", 
+               options.max_messages, options.message_ttl, options.lru_enabled, mode, options.max_messages, options.message_ttl, options.lru_enabled, mode);
+        
+        let channel = self.get_or_create_topic_with_options(topic.clone(), options.clone()).await;
+        let mut subscriber = channel.add_subscriber(None, mode).await;
+        subscriber.topic_name = topic;
+        subscriber.options = options;
+        
+        let count = channel.subscriber_count.load(Ordering::SeqCst);
+        debug!("主题订阅成功（带选项与模式），当前订阅者数量: {} / Topic subscription successful (with options and mode), current subscriber count: {}", count, count);
+        Ok(subscriber)
+    }
+
     pub async fn subscribe_group_with_options(&self, topic: String, options: TopicOptions, consumer_id: String, mode: ConsumptionMode) -> anyhow::Result<Subscriber> {
         info!("创建带选项的消费者组订阅者，主题: {}, ID: {} / Creating consumer group subscriber with options, topic: {}, ID: {}", topic, consumer_id, topic, consumer_id);
         
@@ -456,7 +467,7 @@ impl TopicManager {
         }
     }
 
-    pub async fn delete_topic(&self, topic: &str) -> bool {
+pub async fn delete_topic(&self, topic: &str) -> bool {
         let mut topics = self.topics.write().await;
         if topics.remove(topic).is_some() {
             info!("删除主题: {} / Deleting topic: {}", topic, topic);
@@ -465,6 +476,12 @@ impl TopicManager {
             warn!("尝试删除不存在的主题: {} / Attempting to delete non-existent topic: {}", topic, topic);
             false
         }
+    }
+}
+
+impl Default for TopicManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
