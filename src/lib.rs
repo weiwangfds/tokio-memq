@@ -229,5 +229,7 @@ pub use mq::serializer::{
 };
 pub use mq::publisher::Publisher;
 pub use mq::subscriber::Subscriber;
-pub use mq::broker::TopicManager;
+pub use mq::broker::{
+    TopicManager, PartitionedTopicChannel, PartitionRouting, PartitionStats, TopicStats
+};
 pub use mq::MessageQueue;

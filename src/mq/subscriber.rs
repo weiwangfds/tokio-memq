@@ -1,5 +1,6 @@
 use std::collections::{VecDeque, HashMap};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::hash::{Hash, Hasher};
 use tokio::sync::{Mutex, RwLock, watch};
 use log::{debug, info, error};
 use tokio_stream::Stream;
@@ -21,6 +22,8 @@ pub struct Subscriber {
     pub consumption_mode: ConsumptionMode,
     consumer_offsets: Arc<RwLock<HashMap<String, usize>>>,
     channel_notify: watch::Receiver<usize>,
+    // 公平调度：消费者唯一标识符，用于随机延迟种子
+    unique_seed: u64,
 }
 
 impl Subscriber {
@@ -37,6 +40,20 @@ impl Subscriber {
         consumer_offsets: Arc<RwLock<HashMap<String, usize>>>,
         channel_notify: watch::Receiver<usize>,
     ) -> Self {
+        // 为每个消费者生成唯一的种子，用于公平调度
+        let seed_str = format!("{}-{}-{}",
+            consumer_id.as_ref().unwrap_or(&"anonymous".to_string()),
+            topic_name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        seed_str.hash(&mut hasher);
+        let unique_seed = hasher.finish();
+
         Subscriber {
             topic_name,
             // receiver removed
@@ -48,6 +65,7 @@ impl Subscriber {
             consumption_mode,
             consumer_offsets,
             channel_notify,
+            unique_seed,
         }
     }
 
@@ -56,9 +74,11 @@ impl Subscriber {
     /// Get current target offset.
     async fn get_target_offset(&self) -> usize {
         if let Some(ref id) = self.consumer_id {
+            // 对于有消费者ID的订阅者，使用共享偏移量（竞争消费）
             let offsets = self.consumer_offsets.read().await;
             *offsets.get(id).unwrap_or(&0)
         } else {
+            // 对于没有消费者ID的订阅者，使用本地偏移量（广播消费）
             let current = self.current_offset.lock().await;
             current.unwrap_or(0)
         }
@@ -69,10 +89,11 @@ impl Subscriber {
     /// Advance offset.
     async fn advance_offset(&self, new_offset: usize) {
         if let Some(ref id) = self.consumer_id {
+            // 对于有消费者ID的订阅者，更新共享偏移量（竞争消费）
             let mut offsets = self.consumer_offsets.write().await;
             offsets.insert(id.clone(), new_offset);
         }
-        // Update local tracking (Next Offset)
+        // Update local tracking (Next Offset) - 用于所有订阅者
         let mut current = self.current_offset.lock().await;
         *current = Some(new_offset);
     }
@@ -87,6 +108,7 @@ impl Subscriber {
         if last_offset < target_offset { return None; }
         let front_offset = buffer.front().unwrap().offset;
         if target_offset < front_offset {
+            // 对于广播消费者，从第一个可用消息开始
             for msg in buffer.iter() {
                 if let Some(ttl) = self.options.message_ttl {
                     if msg.is_expired(ttl) { continue; }
@@ -123,6 +145,26 @@ impl Subscriber {
         None
     }
 
+    /// 公平调度延迟计算
+    ///
+    /// Calculate fair scheduling delay based on consumer ID and unique seed.
+    async fn fair_scheduling_delay(&self) -> u64 {
+        if let Some(ref consumer_id) = self.consumer_id {
+            // 使用消费者ID生成0-10ms的延迟，确保相同ID的消费者有公平竞争机会
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            consumer_id.hash(&mut hasher);
+            self.unique_seed.hash(&mut hasher);
+            let hash = hasher.finish();
+
+            // 基于哈希值生成0-5ms的延迟
+            let delay_ms = (hash % 6) as u64;
+            debug!("公平调度延迟: 消费者ID {}, 延迟: {}ms / Fair scheduling delay: consumer ID {}, delay: {}ms", consumer_id, delay_ms, consumer_id, delay_ms);
+            delay_ms
+        } else {
+            0
+        }
+    }
+
     /// 手动提交偏移量
     ///
     /// Manually commit offset.
@@ -139,12 +181,16 @@ impl Subscriber {
     }
 
 
-    async fn recv_metadata_log_based(&self, consumer_id: &str) -> anyhow::Result<MessageMetadata> {
+    async fn recv_metadata_log_based(&self, _consumer_id: &str) -> anyhow::Result<MessageMetadata> {
         loop {
             let mut rx = self.channel_notify.clone();
             let target_offset = {
                 let offsets = self.consumer_offsets.read().await;
-                *offsets.get(consumer_id).unwrap_or(&0)
+                if let Some(ref id) = self.consumer_id {
+                    *offsets.get(id).unwrap_or(&0)
+                } else {
+                    0
+                }
             };
 
             let meta_opt = {
@@ -190,7 +236,9 @@ impl Subscriber {
                 let next_offset = meta.offset + 1;
                 {
                     let mut offsets = self.consumer_offsets.write().await;
-                    offsets.insert(consumer_id.to_string(), next_offset);
+                    if let Some(ref id) = self.consumer_id {
+                        offsets.insert(id.to_string(), next_offset);
+                    }
                 }
                 let mut current_offset = self.current_offset.lock().await;
                 *current_offset = Some(meta.offset);
@@ -395,15 +443,25 @@ impl MessageSubscriber for Subscriber {
             // Register notification listener before checking buffer
             let mut rx = self.channel_notify.clone();
             let target_offset = self.get_target_offset().await;
-            
+
             if let Some(msg) = self.fetch_from_buffer(target_offset).await {
                 self.advance_offset(msg.offset + 1).await;
                 return Ok(msg.message);
             }
-            
+
             // Wait for notification
             if rx.changed().await.is_err() {
                  return Err(anyhow::anyhow!("Topic closed"));
+            }
+
+            // 公平调度：为相同消费者ID的订阅者添加随机延迟
+            // 这样相同ID的消费者有公平机会获取消息
+            if let Some(ref consumer_id) = self.consumer_id {
+                // 使用消费者ID和唯一种子生成确定性延迟
+                let delay_ms = self.fair_scheduling_delay().await;
+                if delay_ms > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
             }
         }
     }

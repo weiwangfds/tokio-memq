@@ -5,6 +5,9 @@ pub mod publisher;
 pub mod subscriber;
 pub mod broker;
 
+// Re-export partition types
+pub use broker::{PartitionRouting, PartitionStats};
+
 pub use traits::{MessagePublisher, AsyncMessagePublisher, MessageSubscriber, QueueManager};
 pub use message::{TopicMessage, TopicOptions, TimestampedMessage, ConsumptionMode};
 pub use serializer::{
@@ -118,6 +121,93 @@ impl MessageQueue {
     /// Delete a topic.
     pub async fn delete_topic(&self, topic: &str) -> bool {
         self.topic_manager.delete_topic(topic).await
+    }
+
+    // ========== 分区主题 API ==========
+
+    /// 创建分区主题
+    ///
+    /// Create a partitioned topic.
+    pub async fn create_partitioned_topic(&self, topic: String, options: TopicOptions, partition_count: usize) -> anyhow::Result<()> {
+        self.topic_manager.get_or_create_partitioned_topic(topic, options, partition_count).await?;
+        Ok(())
+    }
+
+    /// 发布消息到分区主题（自动路由）
+    ///
+    /// Publish message to partitioned topic with automatic routing.
+    pub async fn publish_to_partitioned(&self, message: TopicMessage) -> anyhow::Result<()> {
+        self.topic_manager.publish_to_partitioned(message).await
+    }
+
+    /// 批量发布消息到分区主题（自动路由）
+    ///
+    /// Publish batch messages to partitioned topic with automatic routing.
+    pub async fn publish_batch_to_partitioned(&self, messages: Vec<TopicMessage>) -> anyhow::Result<()> {
+        self.topic_manager.publish_batch_to_partitioned(messages).await
+    }
+
+    /// 订阅分区主题的指定分区
+    ///
+    /// Subscribe to a specific partition of a partitioned topic.
+    pub async fn subscribe_partition(
+        &self,
+        topic: String,
+        partition: usize,
+        consumer_id: Option<String>,
+        mode: ConsumptionMode,
+    ) -> anyhow::Result<Subscriber> {
+        self.topic_manager.subscribe_partition(topic, partition, consumer_id, mode).await
+    }
+
+    /// 订阅分区主题的指定分区（使用选项）
+    ///
+    /// Subscribe to a specific partition of a partitioned topic with options.
+    pub async fn subscribe_partition_with_options(
+        &self,
+        topic: String,
+        partition: usize,
+        options: TopicOptions,
+        consumer_id: Option<String>,
+        mode: ConsumptionMode,
+    ) -> anyhow::Result<Subscriber> {
+        self.create_partitioned_topic(topic.clone(), options, partition + 1).await?;
+        self.subscribe_partition(topic, partition, consumer_id, mode).await
+    }
+
+    /// 获取分区统计信息
+    ///
+    /// Get partition statistics.
+    pub async fn get_partition_stats(&self, topic: String, partition: usize) -> Option<PartitionStats> {
+        self.topic_manager.get_partition_stats(topic, partition).await
+    }
+
+    /// 获取所有分区统计信息
+    ///
+    /// Get all partition statistics for a topic.
+    pub async fn get_all_partition_stats(&self, topic: String) -> Vec<PartitionStats> {
+        self.topic_manager.get_all_partition_stats(topic).await
+    }
+
+    /// 设置分区路由策略
+    ///
+    /// Set partition routing strategy.
+    pub async fn set_partition_routing(&self, topic: String, strategy: PartitionRouting) -> anyhow::Result<()> {
+        self.topic_manager.set_partition_routing(topic, strategy).await
+    }
+
+    /// 删除分区主题
+    ///
+    /// Delete a partitioned topic.
+    pub async fn delete_partitioned_topic(&self, topic: &str) -> bool {
+        self.topic_manager.delete_partitioned_topic(topic).await
+    }
+
+    /// 列出所有分区主题
+    ///
+    /// List all partitioned topics.
+    pub async fn list_partitioned_topics(&self) -> Vec<String> {
+        self.topic_manager.list_partitioned_topics().await
     }
 }
 

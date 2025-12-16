@@ -27,16 +27,21 @@ pub struct TopicOptions {
     ///
     /// Consume idle timeout (reserved).
     pub consume_idle_timeout: Option<Duration>,
+    /// 分区数量
+    ///
+    /// Number of partitions for parallel processing.
+    pub partitions: Option<usize>,
 }
 
 impl Default for TopicOptions {
     fn default() -> Self {
         TopicOptions {
-            max_messages: Some(10000), 
+            max_messages: Some(10000),
             message_ttl: None,
             lru_enabled: true,        // 默认开启 LRU / Enable LRU by default
             idle_timeout: None,
             consume_idle_timeout: None,
+            partitions: None,         // 默认无分区 / No partitions by default
         }
     }
 }
@@ -133,6 +138,10 @@ pub struct TopicMessage {
     pub format: SerializationFormat,
     pub created_at: Instant,
     pub offset: Option<usize>,
+    /// 消息键，用于分区路由
+    ///
+    /// Message key for partition routing.
+    pub key: Option<String>,
 }
 
 impl TopicMessage {
@@ -154,6 +163,7 @@ impl TopicMessage {
                     format,
                     created_at: Instant::now(),
                     offset: None,
+                    key: None,
                 })
             }
             Err(e) => {
@@ -165,6 +175,66 @@ impl TopicMessage {
     
     fn default_format() -> SerializationFormat {
         SerializationFormat::Bincode
+    }
+
+    /// 使用默认序列化格式和键创建消息
+    ///
+    /// Create a message with default format and key for partition routing.
+    pub fn new_with_key<T: serde::Serialize>(topic: String, data: &T, key: String) -> Result<Self, SerializationError> {
+        let format = Self::default_format();
+        debug!("创建消息，主题: {}, 默认格式: {:?}, 键: {} / Creating message, topic: {}, default format: {:?}, key: {}", topic, format, key, topic, format, key);
+
+        match SerializationHelper::serialize(data, &format) {
+            Ok(payload) => {
+                debug!("消息创建成功，主题: {}, 格式: {:?}, 大小: {} 字节, 键: {} / Message created successfully, topic: {}, format: {:?}, size: {} bytes, key: {}",
+                       topic, format, payload.len(), key, topic, format, payload.len(), key);
+
+                Ok(TopicMessage {
+                    topic,
+                    payload,
+                    format,
+                    created_at: Instant::now(),
+                    offset: None,
+                    key: Some(key),
+                })
+            }
+            Err(e) => {
+                error!("消息序列化失败，主题: {}, 格式: {:?}, 键: {}, 错误: {} / Message serialization failed, topic: {}, format: {:?}, key: {}, error: {}", topic, format, key, e, topic, format, key, e);
+                Err(e)
+            }
+        }
+    }
+
+    /// 使用指定序列化格式和键创建消息
+    ///
+    /// Create a message with specified format and key for partition routing.
+    pub fn new_with_format_and_key<T: serde::Serialize>(
+        topic: String,
+        data: &T,
+        format: SerializationFormat,
+        key: String
+    ) -> Result<Self, SerializationError> {
+        debug!("创建消息，主题: {}, 指定格式: {:?}, 键: {} / Creating message, topic: {}, specified format: {:?}, key: {}", topic, format, key, topic, format, key);
+
+        match SerializationHelper::serialize(data, &format) {
+            Ok(payload) => {
+                info!("消息创建成功，主题: {}, 格式: {:?}, 大小: {} 字节, 键: {} / Message created successfully, topic: {}, format: {:?}, size: {} bytes, key: {}",
+                      topic, format, payload.len(), key, topic, format, payload.len(), key);
+
+                Ok(TopicMessage {
+                    topic,
+                    payload,
+                    format,
+                    created_at: Instant::now(),
+                    offset: None,
+                    key: Some(key),
+                })
+            }
+            Err(e) => {
+                error!("消息序列化失败，主题: {}, 格式: {:?}, 键: {}, 错误: {} / Message serialization failed, topic: {}, format: {:?}, key: {}, error: {}", topic, format, key, e, topic, format, key, e);
+                Err(e)
+            }
+        }
     }
 
     /// 使用指定序列化格式创建消息
@@ -188,6 +258,7 @@ impl TopicMessage {
                     format,
                     created_at: Instant::now(),
                     offset: None,
+                    key: None,
                 })
             }
             Err(e) => {
@@ -210,6 +281,7 @@ impl TopicMessage {
             format,
             created_at: Instant::now(),
             offset: None,
+            key: None,
         }
     }
 
@@ -229,6 +301,7 @@ impl TopicMessage {
             format,
             created_at: Instant::now(),
             offset: None,
+            key: None,
         }
     }
 
@@ -249,6 +322,7 @@ impl TopicMessage {
             format: SerializationFormat::Bincode,
             created_at: Instant::now(),
             offset: None,
+            key: None,
         }
     }
 
