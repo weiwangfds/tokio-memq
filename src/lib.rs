@@ -212,13 +212,62 @@
 //!     Some(pipeline),
 //! );
 //! ```
+//!
+//! ### 7. Partitioned Topics (Sharding)
+//! 
+//! Create a partitioned topic with multiple routing strategies (RoundRobin, Hash, Random, Fixed),
+//! publish messages with automatic routing, subscribe to a specific partition, and inspect per-partition stats.
+//!
+//! ```rust
+//! use tokio_memq::mq::{MessageQueue, TopicOptions, ConsumptionMode, PartitionRouting};
+//! # use tokio_memq::mq::TopicMessage;
+//! # use tokio_memq::MessageSubscriber;
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     let mq = MessageQueue::new();
+//!     let topic = "partitioned_events".to_string();
+//!
+//!     // Create a topic with 4 partitions
+//!     let options = TopicOptions {
+//!         max_messages: Some(1000),
+//!         partitions: Some(4),
+//!         ..Default::default()
+//!     };
+//!     mq.create_partitioned_topic(topic.clone(), options, 4).await?;
+//!
+//!     // Set routing strategy
+//!     mq.set_partition_routing(topic.clone(), PartitionRouting::RoundRobin).await?;
+//!
+//!     // Publish a few messages (auto-routed)
+//!     for i in 1..=8 {
+//!         let message = tokio_memq::TopicMessage::new(topic.clone(), &format!("msg {}", i))?;
+//!         mq.publish_to_partitioned(message).await?;
+//!     }
+//!
+//!     // Subscribe to a specific partition (0) and consume one message
+//!     let sub0 = mq.subscribe_partition(
+//!         topic.clone(), 
+//!         0, 
+//!         Some("partition_demo".to_string()),
+//!         ConsumptionMode::Earliest
+//!     ).await?;
+//!
+//!     if let Some(msg) = sub0.recv_timeout(Duration::from_millis(500)).await? {
+//!         println!("Partition 0 got: {}", msg.payload_str());
+//!     }
+//!
+//!     // Inspect partition stats
+//!     if let Some(stats) = mq.get_partition_stats(topic.clone(), 0).await {
+//!         println!("Partition 0: {} messages, {} subscribers", stats.message_count, stats.subscriber_count);
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
 
 pub mod mq;
-pub mod tcp {
-    pub mod protocol;
-    pub mod server;
-    pub mod client;
-}
 
 pub use mq::traits::{MessagePublisher, AsyncMessagePublisher, MessageSubscriber, QueueManager};
 pub use mq::message::{TopicMessage, TopicOptions, TimestampedMessage, ConsumptionMode};

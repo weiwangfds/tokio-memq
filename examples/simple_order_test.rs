@@ -142,8 +142,6 @@ async fn main() -> anyhow::Result<()> {
                 let payload = msg.payload_str();
                 println!("Received: {}", payload);
 
-                let current_type = if i <= 10 { "Batch" } else { "Single" };
-
                 if expected_type == "Batch" && !payload.contains("Batch message") {
                     all_ordered = false;
                     println!("❌ Position {} should be Batch message", i);

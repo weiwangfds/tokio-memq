@@ -157,7 +157,7 @@ impl Subscriber {
             let hash = hasher.finish();
 
             // 基于哈希值生成0-5ms的延迟
-            let delay_ms = (hash % 6) as u64;
+            let delay_ms = hash % 6;
             debug!("公平调度延迟: 消费者ID {}, 延迟: {}ms / Fair scheduling delay: consumer ID {}, delay: {}ms", consumer_id, delay_ms, consumer_id, delay_ms);
             delay_ms
         } else {
@@ -456,7 +456,7 @@ impl MessageSubscriber for Subscriber {
 
             // 公平调度：为相同消费者ID的订阅者添加随机延迟
             // 这样相同ID的消费者有公平机会获取消息
-            if let Some(ref consumer_id) = self.consumer_id {
+            if self.consumer_id.is_some() {
                 // 使用消费者ID和唯一种子生成确定性延迟
                 let delay_ms = self.fair_scheduling_delay().await;
                 if delay_ms > 0 {

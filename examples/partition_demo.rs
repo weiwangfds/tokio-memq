@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 发布带键的消息，观察哈希分布
     let users = ["alice", "bob", "charlie", "david", "eve"];
-    for (i, user) in users.iter().enumerate() {
+    for user in users.iter() {
         for j in 1..=3 {
             let message = tokio_memq::TopicMessage::new_with_key(
                 topic.clone(),

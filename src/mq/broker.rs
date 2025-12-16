@@ -65,7 +65,6 @@ pub struct TopicChannel {
 #[derive(Clone, Debug, Default)]
 struct GroupStats {
     active_consumers: usize,
-    last_consumer_index: usize,
 }
 
 /// 分区主题通道
