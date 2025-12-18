@@ -3,6 +3,7 @@ use crate::mq::message::TopicMessage;
 use crate::mq::serializer::{SerializationFormat, SerializationFactory, SerializationHelper};
 use crate::mq::broker::TopicManager;
 use log::{debug, info};
+use std::sync::Arc;
 
 #[derive(Clone)]
 /// 主题发布者
@@ -10,7 +11,7 @@ use log::{debug, info};
 /// Topic publisher.
 pub struct Publisher {
     topic_manager: TopicManager,
-    topic: String,
+    topic: Arc<String>,
     publisher_key: Option<String>,
 }
 
@@ -20,7 +21,7 @@ impl Publisher {
     /// Create a new publisher.
     pub fn new(topic_manager: TopicManager, topic: String) -> Self {
         debug!("创建新的发布者，主题: {} / Creating new publisher, topic: {}", topic, topic);
-        Publisher { topic_manager, topic, publisher_key: None }
+        Publisher { topic_manager, topic: Arc::new(topic), publisher_key: None }
     }
 
     /// 使用发布者键创建新的发布者（同一主题可有不同默认设置）
@@ -28,13 +29,13 @@ impl Publisher {
     /// Create a new publisher with a specific key (per-publisher defaults).
     pub fn new_with_key(topic_manager: TopicManager, topic: String, publisher_key: String) -> Self {
         debug!("创建带发布者键的发布者，主题: {}, 键: {} / Creating keyed publisher, topic: {}, key: {}", topic, publisher_key, topic, publisher_key);
-        Publisher { topic_manager, topic, publisher_key: Some(publisher_key) }
+        Publisher { topic_manager, topic: Arc::new(topic), publisher_key: Some(publisher_key) }
     }
 
     /// 序列化并发布任意可序列化数据
     ///
     /// Serialize and publish any `serde::Serialize` data.
-    pub async fn publish<T: serde::Serialize + Send + Sync + 'static + Clone>(&self, data: T) -> anyhow::Result<()> {
+    pub(crate) async fn publish_internal<T: serde::Serialize + Send + Sync + 'static>(&self, data: T) -> anyhow::Result<()> {
         debug!("开始序列化并发布消息到主题: {} / Start serializing and publishing message to topic: {}", self.topic, self.topic);
 
         let keyed = self.publisher_key.as_ref().and_then(|k| SerializationFactory::get_publisher_defaults(k));
@@ -43,15 +44,15 @@ impl Publisher {
         let message = if let Some(settings) = keyed.or_else(|| SerializationFactory::get_topic_defaults(&self.topic)) {
              // 如果配置是 Native，则直接传递对象
             if settings.format == SerializationFormat::Native {
-                TopicMessage::new_with_format(self.topic.clone(), data, SerializationFormat::Native)?
+                TopicMessage::new_shared_topic(self.topic.clone(), data, SerializationFormat::Native)?
             } else {
                 let payload = SerializationHelper::serialize_with_settings(&data, &settings)?;
                 let format = settings.format.clone();
-                TopicMessage::from_bytes(self.topic.clone(), payload, format)
+                TopicMessage::from_shared_bytes_topic(self.topic.clone(), payload, format)
             }
         } else {
-            // 默认情况下，TopicMessage::new 现在使用 Native 格式
-            TopicMessage::new(self.topic.clone(), data)?
+            // 默认情况下，使用 Native 格式
+            TopicMessage::new_shared_topic(self.topic.clone(), data, SerializationFormat::Native)?
         };
         
         debug!("消息创建成功，格式: {:?}, 大小: {} 字节 / Message created successfully, format: {:?}, size: {} bytes", message.format, message.payload.len(), message.format, message.payload.len());
@@ -64,10 +65,10 @@ impl Publisher {
     /// 发布已序列化的字符串负载
     ///
     /// Publish a pre-serialized string payload.
-    pub async fn publish_serialized(&self, payload: String) -> anyhow::Result<()> {
+    pub(crate) async fn publish_serialized_internal(&self, payload: String) -> anyhow::Result<()> {
         debug!("发布已序列化的字符串数据到主题: {}, 大小: {} 字节 / Publishing serialized string data to topic: {}, size: {} bytes", self.topic, payload.len(), self.topic, payload.len());
         
-        let message = TopicMessage::from_serialized(self.topic.clone(), payload);
+        let message = TopicMessage::from_shared_serialized_topic(self.topic.clone(), payload);
         let summary = message.display_payload(256);
         info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, summary, self.topic, summary);
         self.topic_manager.publish(message).await
@@ -77,7 +78,7 @@ impl Publisher {
     ///
     /// Publish a plain string (alias to `publish_serialized`).
     pub async fn publish_string(&self, payload: String) -> anyhow::Result<()> {
-        self.publish_serialized(payload).await
+        self.publish_serialized_internal(payload).await
     }
 
     /// 指定序列化格式发布数据
@@ -90,7 +91,7 @@ impl Publisher {
     ) -> anyhow::Result<()> {
         debug!("使用 {:?} 格式发布消息到主题: {} / Publishing message to topic: {} using format: {:?}", format, self.topic, self.topic, format);
         
-        let message = TopicMessage::new_with_format(self.topic.clone(), data, format)?;
+        let message = TopicMessage::new_shared_topic(self.topic.clone(), data, format)?;
         debug!("消息序列化完成，格式: {:?}, 大小: {} 字节 / Message serialization completed, format: {:?}, size: {} bytes", message.format, message.payload.len(), message.format, message.payload.len());
         let summary = message.display_payload(256);
         info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, summary, self.topic, summary);
@@ -108,10 +109,33 @@ impl Publisher {
     /// 发布字节数组负载并指定格式
     ///
     /// Publish raw bytes with specified `SerializationFormat`.
-    pub async fn publish_bytes(&self, data: Vec<u8>, format: SerializationFormat) -> anyhow::Result<()> {
-        let message = TopicMessage::from_bytes(self.topic.clone(), data, format);
+    pub(crate) async fn publish_bytes_internal(&self, data: Vec<u8>, format: SerializationFormat) -> anyhow::Result<()> {
+        let message = TopicMessage::from_shared_bytes_topic(self.topic.clone(), data, format);
         let summary = message.display_payload(256);
         info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, summary, self.topic, summary);
+        self.topic_manager.publish(message).await
+    }
+
+    /// 发布共享的字节数据（零拷贝）
+    ///
+    /// Publish shared byte data (zero-copy).
+    pub async fn publish_shared_bytes(&self, data: std::sync::Arc<Vec<u8>>, format: SerializationFormat) -> anyhow::Result<()> {
+        let message = TopicMessage::from_shared_data(self.topic.clone(), data, format);
+        let summary = message.display_payload(256);
+        info!("发布共享内容到主题 {}: {} / Publishing shared content to topic {}: {}", self.topic, summary, self.topic, summary);
+        self.topic_manager.publish(message).await
+    }
+
+    /// 发布完全共享的消息数据（主题和负载均为共享指针，完全零拷贝）
+    ///
+    /// Publish fully shared message data (topic and payload are shared pointers, fully zero-copy).
+    pub async fn publish_shared_data(&self, topic: std::sync::Arc<String>, data: std::sync::Arc<Vec<u8>>, format: SerializationFormat) -> anyhow::Result<()> {
+        if *topic != *self.topic {
+             return Err(anyhow::anyhow!("Topic mismatch: expected {}, got {}", self.topic, topic));
+        }
+        let message = TopicMessage::from_shared_data(topic, data, format);
+        let summary = message.display_payload(256);
+        info!("发布完全共享内容到主题 {}: {} / Publishing fully shared content to topic {}: {}", self.topic, summary, self.topic, summary);
         self.topic_manager.publish(message).await
     }
 
@@ -132,20 +156,20 @@ impl Publisher {
     /// 批量发布消息
     ///
     /// Batch publish messages.
-    pub async fn publish_batch<T: serde::Serialize + Send + Sync + 'static + Clone>(&self, data_list: Vec<T>) -> anyhow::Result<()> {
+    pub(crate) async fn publish_batch_internal<T: serde::Serialize + Send + Sync + 'static>(&self, data_list: Vec<T>) -> anyhow::Result<()> {
         let mut messages = Vec::with_capacity(data_list.len());
         for data in data_list {
             let keyed = self.publisher_key.as_ref().and_then(|k| SerializationFactory::get_publisher_defaults(k));
             if let Some(settings) = keyed.or_else(|| SerializationFactory::get_topic_defaults(&self.topic)) {
                 if settings.format == SerializationFormat::Native {
-                    messages.push(TopicMessage::new_with_format(self.topic.clone(), data, SerializationFormat::Native)?);
+                    messages.push(TopicMessage::new_shared_topic(self.topic.clone(), data, SerializationFormat::Native)?);
                 } else {
                     let payload = SerializationHelper::serialize_with_settings(&data, &settings)?;
                     let format = settings.format.clone();
-                    messages.push(TopicMessage::from_bytes(self.topic.clone(), payload, format));
+                    messages.push(TopicMessage::from_shared_bytes_topic(self.topic.clone(), payload, format));
                 }
             } else {
-                messages.push(TopicMessage::new(self.topic.clone(), data)?);
+                messages.push(TopicMessage::new_shared_topic(self.topic.clone(), data, SerializationFormat::Native)?);
             }
         }
         self.topic_manager.publish_batch(messages).await
@@ -161,7 +185,7 @@ impl Publisher {
     ) -> anyhow::Result<()> {
         let mut messages = Vec::with_capacity(data_list.len());
         for data in data_list {
-            messages.push(TopicMessage::new_with_format(self.topic.clone(), data, format.clone())?);
+            messages.push(TopicMessage::new_shared_topic(self.topic.clone(), data, format.clone())?);
         }
         self.topic_manager.publish_batch(messages).await
     }
@@ -178,6 +202,22 @@ impl AsyncMessagePublisher for Publisher {
     fn topic(&self) -> &str {
         &self.topic
     }
+
+    async fn publish<T: serde::Serialize + Send + Sync + 'static>(&self, data: T) -> anyhow::Result<()> {
+        self.publish_internal(data).await
+    }
+
+    async fn publish_batch<T: serde::Serialize + Send + Sync + 'static>(&self, data_list: Vec<T>) -> anyhow::Result<()> {
+        self.publish_batch_internal(data_list).await
+    }
+
+    async fn publish_serialized(&self, payload: String) -> anyhow::Result<()> {
+        self.publish_serialized_internal(payload).await
+    }
+
+    async fn publish_bytes(&self, data: Vec<u8>, format: SerializationFormat) -> anyhow::Result<()> {
+        self.publish_bytes_internal(data, format).await
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +226,7 @@ mod tests {
     use crate::mq::MessageQueue;
     use crate::mq::serializer::{SerializationFactory, SerializationConfig, JsonConfig, MessagePackConfig};
     use crate::mq::serializer::SerializationFormat;
+    use crate::mq::traits::{AsyncMessagePublisher, MessageSubscriber};
 
     #[tokio::test]
     async fn test_per_publisher_defaults() -> anyhow::Result<()> {
@@ -218,8 +259,8 @@ mod tests {
         let pub_b = mq.publisher_with_key(topic.clone(), "pubB".to_string());
         let subscriber = mq.subscriber(topic.clone()).await?;
 
-        pub_a.publish(&serde_json::json!({"a":1})).await?;
-        pub_b.publish(&serde_json::json!({"b":2})).await?;
+        pub_a.publish(serde_json::json!({"a":1})).await?;
+        pub_b.publish(serde_json::json!({"b":2})).await?;
 
         let batch = subscriber.recv_batch(2).await?;
         assert_eq!(batch.len(), 2);

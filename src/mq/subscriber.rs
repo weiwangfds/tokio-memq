@@ -98,6 +98,41 @@ impl Subscriber {
         *current = Some(new_offset);
     }
 
+    /// 从缓冲区批量获取消息
+    ///
+    /// Fetch batch of messages from buffer.
+    async fn fetch_batch_from_buffer(&self, target_offset: usize, batch_size: usize) -> Vec<TimestampedMessage> {
+        let buffer = self.message_buffer.read().await;
+        if buffer.is_empty() { return Vec::new(); }
+        
+        let last_offset = buffer.back().unwrap().offset;
+        if last_offset < target_offset { return Vec::new(); }
+        
+        let mut messages = Vec::with_capacity(batch_size);
+        let front_offset = buffer.front().unwrap().offset;
+        
+        let start_idx = if target_offset < front_offset {
+            0
+        } else {
+            target_offset - front_offset
+        };
+
+        for msg in buffer.iter().skip(start_idx) {
+            if messages.len() >= batch_size {
+                break;
+            }
+            
+            if msg.offset >= target_offset {
+                if let Some(ttl) = self.options.message_ttl {
+                    if msg.is_expired(ttl) { continue; }
+                }
+                messages.push(msg.clone());
+            }
+        }
+        
+        messages
+    }
+
     /// 从缓冲区获取消息
     ///
     /// Fetch message from buffer.
@@ -168,7 +203,7 @@ impl Subscriber {
     /// 手动提交偏移量
     ///
     /// Manually commit offset.
-    pub async fn commit(&self, offset: usize) -> anyhow::Result<()> {
+    pub(crate) async fn commit_internal(&self, offset: usize) -> anyhow::Result<()> {
         self.advance_offset(offset).await;
         Ok(())
     }
@@ -176,8 +211,8 @@ impl Subscriber {
     /// 跳转到指定偏移量
     ///
     /// Seek to specific offset.
-    pub async fn seek(&self, offset: usize) -> anyhow::Result<()> {
-        self.commit(offset).await
+    pub(crate) async fn seek_internal(&self, offset: usize) -> anyhow::Result<()> {
+        self.commit_internal(offset).await
     }
 
 
@@ -253,7 +288,7 @@ impl Subscriber {
 }
 
 impl Subscriber {
-    pub async fn recv_typed<T: serde::de::DeserializeOwned + std::any::Any + Send + Sync + Clone>(&self) -> anyhow::Result<T> {
+    pub(crate) async fn recv_typed_internal<T: serde::de::DeserializeOwned + std::any::Any + Send + Sync + Clone>(&self) -> anyhow::Result<T> {
         debug!("等待接收类型化消息，主题: {} / Waiting to receive typed message, topic: {}", self.topic_name, self.topic_name);
         
         let message = self.recv().await?;
@@ -372,7 +407,7 @@ impl Subscriber {
         &self.topic_name
     }
 
-    pub fn stream(&self) -> impl Stream<Item = anyhow::Result<TopicMessage>> + '_ {
+    pub(crate) fn stream_internal(&self) -> impl Stream<Item = anyhow::Result<TopicMessage>> + '_ {
         try_stream! {
             loop {
                 let msg = self.recv().await?;
@@ -381,33 +416,36 @@ impl Subscriber {
         }
     }
 
-    pub async fn recv_timeout(&self, duration: std::time::Duration) -> anyhow::Result<Option<TopicMessage>> {
+    pub(crate) async fn recv_timeout_internal(&self, duration: std::time::Duration) -> anyhow::Result<Option<TopicMessage>> {
         match tokio::time::timeout(duration, self.recv()).await {
             Ok(res) => res.map(Some),
             Err(_) => Ok(None),
         }
     }
 
-    pub async fn recv_batch(&self, n: usize) -> anyhow::Result<Vec<TopicMessage>> {
+    pub(crate) async fn recv_batch_internal(&self, n: usize) -> anyhow::Result<Vec<TopicMessage>> {
         if n == 0 {
             return Ok(Vec::new());
         }
         
-        let mut messages = Vec::with_capacity(n);
-        
-        // First message (blocking wait)
-        let first = self.recv().await?;
-        messages.push(first);
-        
-        // Subsequent messages (non-blocking)
-        for _ in 1..n {
-             match self.try_recv().await {
-                 Ok(msg) => messages.push(msg),
-                 Err(_) => break,
-             }
+        loop {
+            // Register notification listener before checking buffer
+            let mut rx = self.channel_notify.clone();
+            let target_offset = self.get_target_offset().await;
+            
+            let messages = self.fetch_batch_from_buffer(target_offset, n).await;
+            
+            if !messages.is_empty() {
+                let last_offset = messages.last().unwrap().offset;
+                self.advance_offset(last_offset + 1).await;
+                return Ok(messages.into_iter().map(|m| m.message).collect());
+            }
+            
+            // Wait for notification if no messages available
+            if rx.changed().await.is_err() {
+                 return Err(anyhow::anyhow!("Topic closed"));
+            }
         }
-        
-        Ok(messages)
     }
 
     pub async fn recv_filter<F>(&self, predicate: F) -> anyhow::Result<TopicMessage>
@@ -442,11 +480,29 @@ impl MessageSubscriber for Subscriber {
         loop {
             // Register notification listener before checking buffer
             let mut rx = self.channel_notify.clone();
-            let target_offset = self.get_target_offset().await;
 
-            if let Some(msg) = self.fetch_from_buffer(target_offset).await {
-                self.advance_offset(msg.offset + 1).await;
-                return Ok(msg.message);
+            if let Some(ref id) = self.consumer_id {
+                // Group consumer: lock offsets to ensure atomicity
+                let mut offsets = self.consumer_offsets.write().await;
+                let target_offset = *offsets.get(id).unwrap_or(&0);
+                
+                if let Some(msg) = self.fetch_from_buffer(target_offset).await {
+                    let next_offset = msg.offset + 1;
+                    offsets.insert(id.clone(), next_offset);
+                    
+                    // Update local offset tracking as well
+                    let mut current = self.current_offset.lock().await;
+                    *current = Some(next_offset);
+                    
+                    return Ok(msg.message);
+                }
+            } else {
+                // Non-group consumer
+                let target_offset = self.get_target_offset().await;
+                if let Some(msg) = self.fetch_from_buffer(target_offset).await {
+                    self.advance_offset(msg.offset + 1).await;
+                    return Ok(msg.message);
+                }
             }
 
             // Wait for notification
@@ -477,6 +533,23 @@ impl MessageSubscriber for Subscriber {
         }
     }
 
+    async fn recv_typed<T: serde::de::DeserializeOwned + Send + Sync + 'static + Clone>(&self) -> anyhow::Result<T> {
+        self.recv_typed_internal::<T>().await
+    }
+
+    async fn recv_batch(&self, n: usize) -> anyhow::Result<Vec<TopicMessage>> {
+        self.recv_batch_internal(n).await
+    }
+
+    async fn recv_batch_typed<T: serde::de::DeserializeOwned + Send + Sync + 'static + Clone>(&self, n: usize) -> anyhow::Result<Vec<T>> {
+        let messages = self.recv_batch_internal(n).await?;
+        let mut results = Vec::with_capacity(messages.len());
+        for msg in messages {
+            results.push(msg.deserialize::<T>()?);
+        }
+        Ok(results)
+    }
+
     async fn current_offset(&self) -> Option<usize> {
         if let Some(ref id) = self.consumer_id {
             let offsets = self.consumer_offsets.read().await;
@@ -493,6 +566,22 @@ impl MessageSubscriber for Subscriber {
         }
         let mut offset = self.current_offset.lock().await;
         *offset = Some(0);
+    }
+
+    async fn commit(&self, offset: usize) -> anyhow::Result<()> {
+        self.commit_internal(offset).await
+    }
+
+    async fn seek(&self, offset: usize) -> anyhow::Result<()> {
+        self.seek_internal(offset).await
+    }
+
+    fn stream(&self) -> impl tokio_stream::Stream<Item = anyhow::Result<TopicMessage>> + '_ {
+        self.stream_internal()
+    }
+
+    async fn recv_timeout(&self, duration: std::time::Duration) -> anyhow::Result<Option<TopicMessage>> {
+        self.recv_timeout_internal(duration).await
     }
 
     fn topic(&self) -> &str {

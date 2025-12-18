@@ -1,3 +1,4 @@
+use std::sync::Arc;
 pub mod traits;
 pub mod message;
 pub mod serializer;
@@ -112,7 +113,7 @@ impl MessageQueue {
     ///
     /// Create a topic with options (idempotent).
     pub async fn create_topic(&self, topic: String, options: TopicOptions) -> anyhow::Result<()> {
-        self.topic_manager.get_or_create_topic_with_options(topic, options).await;
+        self.topic_manager.get_or_create_topic_with_options(Arc::new(topic), options).await;
         Ok(())
     }
 

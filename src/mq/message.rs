@@ -6,7 +6,7 @@ use super::serializer::{SerializationFormat, SerializationHelper, SerializationE
 
 #[derive(Clone)]
 pub enum MessagePayload {
-    Bytes(Vec<u8>),
+    Bytes(Arc<Vec<u8>>),
     Native(Arc<dyn Any + Send + Sync>),
 }
 
@@ -154,7 +154,7 @@ impl TimestampedMessage {
 ///
 /// Message metadata (excluding payload).
 pub struct MessageMetadata {
-    pub topic: String,
+    pub topic: Arc<String>,
     pub format: SerializationFormat,
     pub created_at: Instant,
     pub offset: usize,
@@ -166,7 +166,7 @@ pub struct MessageMetadata {
 ///
 /// Topic message payload.
 pub struct TopicMessage {
-    pub topic: String,
+    pub topic: Arc<String>,
     pub payload: MessagePayload,
     pub format: SerializationFormat,
     pub created_at: Instant,
@@ -174,7 +174,7 @@ pub struct TopicMessage {
     /// 消息键，用于分区路由
     ///
     /// Message key for partition routing.
-    pub key: Option<String>,
+    pub key: Option<Arc<String>>,
 }
 
 impl TopicMessage {
@@ -185,6 +185,8 @@ impl TopicMessage {
         let format = Self::default_format();
         debug!("创建消息，主题: {}, 默认格式: {:?} / Creating message, topic: {}, default format: {:?}", topic, format, topic, format);
         
+        let topic = Arc::new(topic);
+
         if format == SerializationFormat::Native {
             debug!("创建原生消息，主题: {} / Creating native message, topic: {}", topic, topic);
             return Ok(TopicMessage {
@@ -204,7 +206,7 @@ impl TopicMessage {
                 
                 Ok(TopicMessage {
                     topic,
-                    payload: MessagePayload::Bytes(bytes),
+                    payload: MessagePayload::Bytes(Arc::new(bytes)),
                     format,
                     created_at: Instant::now(),
                     offset: None,
@@ -229,6 +231,9 @@ impl TopicMessage {
         let format = Self::default_format();
         debug!("创建消息，主题: {}, 默认格式: {:?}, 键: {} / Creating message, topic: {}, default format: {:?}, key: {}", topic, format, key, topic, format, key);
 
+        let topic = Arc::new(topic);
+        let key = Arc::new(key);
+
         if format == SerializationFormat::Native {
             debug!("创建原生消息，主题: {}, 键: {} / Creating native message, topic: {}, key: {}", topic, key, topic, key);
             return Ok(TopicMessage {
@@ -248,7 +253,7 @@ impl TopicMessage {
 
                 Ok(TopicMessage {
                     topic,
-                    payload: MessagePayload::Bytes(bytes),
+                    payload: MessagePayload::Bytes(Arc::new(bytes)),
                     format,
                     created_at: Instant::now(),
                     offset: None,
@@ -273,6 +278,9 @@ impl TopicMessage {
     ) -> Result<Self, SerializationError> {
         debug!("创建消息，主题: {}, 指定格式: {:?}, 键: {} / Creating message, topic: {}, specified format: {:?}, key: {}", topic, format, key, topic, format, key);
 
+        let topic = Arc::new(topic);
+        let key = Arc::new(key);
+
         if format == SerializationFormat::Native {
              return Ok(TopicMessage {
                 topic,
@@ -291,7 +299,7 @@ impl TopicMessage {
 
                 Ok(TopicMessage {
                     topic,
-                    payload: MessagePayload::Bytes(bytes),
+                    payload: MessagePayload::Bytes(Arc::new(bytes)),
                     format,
                     created_at: Instant::now(),
                     offset: None,
@@ -305,6 +313,40 @@ impl TopicMessage {
         }
     }
 
+    /// 使用共享主题创建消息
+    ///
+    /// Create a message with a shared topic (Arc<String>).
+    pub fn new_shared_topic<T: serde::Serialize + Send + Sync + 'static>(
+        topic: Arc<String>,
+        data: T,
+        format: SerializationFormat
+    ) -> Result<Self, SerializationError> {
+        if format == SerializationFormat::Native {
+             return Ok(TopicMessage {
+                topic,
+                payload: MessagePayload::Native(Arc::new(data)),
+                format,
+                created_at: Instant::now(),
+                offset: None,
+                key: None,
+            });
+        }
+
+        match SerializationHelper::serialize(&data, &format) {
+            Ok(bytes) => {
+                Ok(TopicMessage {
+                    topic,
+                    payload: MessagePayload::Bytes(Arc::new(bytes)),
+                    format,
+                    created_at: Instant::now(),
+                    offset: None,
+                    key: None,
+                })
+            }
+            Err(e) => Err(e)
+        }
+    }
+
     /// 使用指定序列化格式创建消息
     ///
     /// Create a message with a specified `SerializationFormat`.
@@ -315,6 +357,8 @@ impl TopicMessage {
     ) -> Result<Self, SerializationError> {
         debug!("创建消息，主题: {}, 指定格式: {:?} / Creating message, topic: {}, specified format: {:?}", topic, format, topic, format);
         
+        let topic = Arc::new(topic);
+
         if format == SerializationFormat::Native {
              return Ok(TopicMessage {
                 topic,
@@ -333,7 +377,7 @@ impl TopicMessage {
                 
                 Ok(TopicMessage {
                     topic,
-                    payload: MessagePayload::Bytes(bytes),
+                    payload: MessagePayload::Bytes(Arc::new(bytes)),
                     format,
                     created_at: Instant::now(),
                     offset: None,
@@ -347,6 +391,70 @@ impl TopicMessage {
         }
     }
 
+    /// 从共享字节数组创建消息（零拷贝）
+    ///
+    /// Create a message from shared bytes (zero-copy).
+    pub fn from_shared_bytes(topic: String, data: Arc<Vec<u8>>, format: SerializationFormat) -> Self {
+        debug!("从共享字节数据创建消息，主题: {}, 格式: {:?}, 大小: {} 字节 / Creating message from shared bytes, topic: {}, format: {:?}, size: {} bytes",
+               topic, format, data.len(), topic, format, data.len());
+        
+        TopicMessage {
+            topic: Arc::new(topic),
+            payload: MessagePayload::Bytes(data),
+            format,
+            created_at: Instant::now(),
+            offset: None,
+            key: None,
+        }
+    }
+
+    /// 从共享字节数组创建消息，使用共享主题（完全零拷贝）
+    ///
+    /// Create a message from shared bytes and shared topic (full zero-copy).
+    pub fn from_shared_data(topic: Arc<String>, data: Arc<Vec<u8>>, format: SerializationFormat) -> Self {
+        debug!("从共享数据创建消息，主题: {}, 格式: {:?}, 大小: {} 字节 / Creating message from shared data, topic: {}, format: {:?}, size: {} bytes",
+               topic, format, data.len(), topic, format, data.len());
+        
+        TopicMessage {
+            topic,
+            payload: MessagePayload::Bytes(data),
+            format,
+            created_at: Instant::now(),
+            offset: None,
+            key: None,
+        }
+    }
+
+    /// 从字节数组创建消息，使用共享主题
+    ///
+    /// Create a message from bytes and shared topic.
+    pub fn from_shared_bytes_topic(topic: Arc<String>, data: Vec<u8>, format: SerializationFormat) -> Self {
+        TopicMessage {
+            topic,
+            payload: MessagePayload::Bytes(Arc::new(data)),
+            format,
+            created_at: Instant::now(),
+            offset: None,
+            key: None,
+        }
+    }
+
+    /// 从序列化字符串创建消息，使用共享主题
+    ///
+    /// Create a message from serialized string and shared topic.
+    pub fn from_shared_serialized_topic(topic: Arc<String>, payload: String) -> Self {
+        let bytes = payload.into_bytes();
+        let format = SerializationHelper::auto_detect_format(&bytes);
+        TopicMessage {
+            topic,
+            payload: MessagePayload::Bytes(Arc::new(bytes)),
+            format,
+            created_at: Instant::now(),
+            offset: None,
+            key: None,
+        }
+    }
+
     /// 从字节数组创建消息
     ///
     /// Create a message from raw bytes.
@@ -355,8 +463,8 @@ impl TopicMessage {
                topic, format, data.len(), topic, format, data.len());
         
         TopicMessage {
-            topic,
-            payload: MessagePayload::Bytes(data),
+            topic: Arc::new(topic),
+            payload: MessagePayload::Bytes(Arc::new(data)),
             format,
             created_at: Instant::now(),
             offset: None,
@@ -375,8 +483,8 @@ impl TopicMessage {
                topic, format, bytes.len(), topic, format, bytes.len());
         
         TopicMessage {
-            topic,
-            payload: MessagePayload::Bytes(bytes),
+            topic: Arc::new(topic),
+            payload: MessagePayload::Bytes(Arc::new(bytes)),
             format,
             created_at: Instant::now(),
             offset: None,
@@ -399,8 +507,8 @@ impl TopicMessage {
     /// Create a message in `Bincode` format.
     pub fn from_bincode(topic: String, data: Vec<u8>) -> Self {
         TopicMessage {
-            topic,
-            payload: MessagePayload::Bytes(data),
+            topic: Arc::new(topic),
+            payload: MessagePayload::Bytes(Arc::new(data)),
             format: SerializationFormat::Bincode,
             created_at: Instant::now(),
             offset: None,

@@ -29,7 +29,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-memq = "0.1"
+tokio-memq = "1.0"
 ```
 
 ## Usage Guide
@@ -229,10 +229,20 @@ let deleted = mq.delete_topic("my_topic").await;
 
 ## Performance
 
-Run the included benchmarks to test performance on your machine:
+Async-MQ is designed for high throughput and low latency. On a standard developer machine (Apple Silicon), it achieves:
+
+| Metric | Result | Note |
+| :--- | :--- | :--- |
+| **Throughput** | **~2,265,000 msgs/sec** | Using batching (100 msgs/batch) |
+| **Latency** | **< 0.5 µs** | Amortized per message |
+| **Bandwidth** | **~6.5 GB/s** | With 1MB payloads |
+
+See [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) for detailed benchmarks.
+
+To run the benchmark suite yourself:
 
 ```bash
-cargo bench
+cargo run --release --example perf_runner
 ```
 
 ## Architecture

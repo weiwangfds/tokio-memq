@@ -30,7 +30,7 @@
 //!
 //! ```rust
 //! use tokio_memq::mq::MessageQueue;
-//! use tokio_memq::MessageSubscriber; // Import trait for recv()
+//! use tokio_memq::{MessageSubscriber, AsyncMessagePublisher}; // Import traits for recv() and publish()
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -45,7 +45,7 @@
 //!     
 //!     // Publish asynchronously so subscriber can receive it
 //!     tokio::spawn(async move {
-//!         pub1.publish(&"Hello World").await.unwrap();
+//!         pub1.publish("Hello World".to_string()).await.unwrap();
 //!     });
 //!
 //!     let msg = sub.recv().await?;
@@ -62,7 +62,7 @@
 //!
 //! ```rust
 //! # use tokio_memq::mq::MessageQueue;
-//! # use tokio_memq::MessageSubscriber;
+//! # use tokio_memq::{MessageSubscriber, AsyncMessagePublisher};
 //! # #[tokio::main]
 //! # async fn main() -> anyhow::Result<()> {
 //! # let mq = MessageQueue::new();
@@ -78,7 +78,7 @@
 //!
 //! // Publish a message to trigger the stream
 //! tokio::spawn(async move {
-//!     pub1.publish(&"Stream Message").await.unwrap();
+//!     pub1.publish("Stream Message".to_string()).await.unwrap();
 //! });
 //!
 //! while let Some(msg_res) = stream.next().await {
@@ -98,7 +98,7 @@
 //!
 //! ```rust
 //! # use tokio_memq::mq::MessageQueue;
-//! # use tokio_memq::MessageSubscriber;
+//! # use tokio_memq::{MessageSubscriber, AsyncMessagePublisher};
 //! # #[tokio::main]
 //! # async fn main() -> anyhow::Result<()> {
 //! # let mq = MessageQueue::new();
@@ -123,7 +123,7 @@
 //!
 //! ```rust
 //! # use tokio_memq::mq::MessageQueue;
-//! # use tokio_memq::MessageSubscriber;
+//! # use tokio_memq::{MessageSubscriber, AsyncMessagePublisher};
 //! # #[tokio::main]
 //! # async fn main() -> anyhow::Result<()> {
 //! # let mq = MessageQueue::new();
@@ -155,7 +155,7 @@
 //!
 //! ```rust
 //! use tokio_memq::mq::{ConsumptionMode, TopicOptions, MessageQueue};
-//! use tokio_memq::MessageSubscriber;
+//! use tokio_memq::{MessageSubscriber, AsyncMessagePublisher};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> anyhow::Result<()> {
@@ -242,7 +242,7 @@
 //!
 //!     // Publish a few messages (auto-routed)
 //!     for i in 1..=8 {
-//!         let message = tokio_memq::TopicMessage::new(topic.clone(), &format!("msg {}", i))?;
+//!         let message = tokio_memq::TopicMessage::new(topic.clone(), format!("msg {}", i))?;
 //!         mq.publish_to_partitioned(message).await?;
 //!     }
 //!

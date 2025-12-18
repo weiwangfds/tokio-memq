@@ -40,6 +40,9 @@ pub struct TopicStats {
     pub subscriber_count: usize,
     pub dropped_messages: usize,
     pub consumer_lags: HashMap<String, usize>,
+    /// 总负载大小（字节）
+    /// Total payload size in bytes
+    pub total_payload_size: usize,
 }
 
 #[derive(Clone)]
@@ -513,6 +516,13 @@ impl TopicChannel {
     pub async fn get_stats(&self) -> TopicStats {
         let buffer = self.message_buffer.read().await;
         let message_count = buffer.len();
+        
+        // 计算总负载大小
+        // Calculate total payload size
+        let total_payload_size: usize = buffer.iter()
+            .map(|msg| msg.message.payload.len())
+            .sum();
+
         let subscriber_count = self.subscriber_count.load(Ordering::SeqCst);
         let dropped_messages = self.dropped_count.load(Ordering::SeqCst);
         
@@ -530,6 +540,7 @@ impl TopicChannel {
             subscriber_count,
             dropped_messages,
             consumer_lags,
+            total_payload_size,
         }
     }
 
@@ -575,34 +586,32 @@ impl TopicManager {
         }
     }
 
-    pub async fn get_or_create_topic(&self, topic: String) -> TopicChannel {
+    pub async fn get_or_create_topic(&self, topic: Arc<String>) -> TopicChannel {
         self.get_or_create_topic_with_options(topic, TopicOptions::default()).await
     }
 
-    pub async fn get_or_create_topic_with_options(&self, topic: String, options: TopicOptions) -> TopicChannel {
+    pub async fn get_or_create_topic_with_options(&self, topic: Arc<String>, options: TopicOptions) -> TopicChannel {
         // Fast path: try read lock first
         {
             let topics = self.topics.read().await;
-            if let Some(channel) = topics.get(&topic) {
+            if let Some(channel) = topics.get(topic.as_str()) {
                 debug!("使用已存在的主题: {} / Using existing topic: {}", topic, topic);
                 return channel.clone();
             }
-        } // Drop read lock
+        }
 
-        // Slow path: acquire write lock
+        // Slow path: write lock
         let mut topics = self.topics.write().await;
-        
         // Double check
-        if let Some(channel) = topics.get(&topic) {
-             debug!("使用已存在的主题 (Double Check): {} / Using existing topic (Double Check): {}", topic, topic);
-             return channel.clone();
+        if let Some(channel) = topics.get(topic.as_str()) {
+            return channel.clone();
         }
 
         info!("创建新主题: {} / Creating new topic: {}", topic, topic);
         debug!("主题配置: max_messages={:?}, message_ttl={:?}, lru_enabled={} / Topic config: max_messages={:?}, message_ttl={:?}, lru_enabled={}", 
                options.max_messages, options.message_ttl, options.lru_enabled, options.max_messages, options.message_ttl, options.lru_enabled);
         let channel = TopicChannel::new(options);
-        topics.insert(topic.clone(), channel.clone());
+        topics.insert(topic.to_string(), channel.clone());
         
         channel
     }
@@ -626,7 +635,7 @@ impl TopicManager {
     pub async fn publish_batch(&self, messages: Vec<TopicMessage>) -> anyhow::Result<()> {
         if messages.is_empty() { return Ok(()); }
         
-        let mut groups: HashMap<String, Vec<TopicMessage>> = HashMap::new();
+        let mut groups: HashMap<Arc<String>, Vec<TopicMessage>> = HashMap::new();
         for msg in messages {
             groups.entry(msg.topic.clone()).or_default().push(msg);
         }
@@ -653,7 +662,7 @@ impl TopicManager {
 
     pub async fn subscribe(&self, topic: String) -> anyhow::Result<Subscriber> {
         info!("创建订阅者，主题: {} / Creating subscriber, topic: {}", topic, topic);
-        let channel = self.get_or_create_topic(topic.clone()).await;
+        let channel = self.get_or_create_topic(Arc::new(topic.clone())).await;
         let subscriber = channel.add_subscriber(topic.clone(), None, ConsumptionMode::default()).await;
 
         let count = channel.subscriber_count.load(Ordering::SeqCst);
@@ -663,7 +672,7 @@ impl TopicManager {
 
     pub async fn subscribe_group(&self, topic: String, consumer_id: String, mode: ConsumptionMode) -> anyhow::Result<Subscriber> {
         info!("创建消费者组订阅者，主题: {}, ID: {}, 模式: {:?} / Creating consumer group subscriber, topic: {}, ID: {}, mode: {:?}", topic, consumer_id, mode, topic, consumer_id, mode);
-        let channel = self.get_or_create_topic(topic.clone()).await;
+        let channel = self.get_or_create_topic(Arc::new(topic.clone())).await;
         let subscriber = channel.add_subscriber(topic.clone(), Some(consumer_id), mode).await;
 
         let count = channel.subscriber_count.load(Ordering::SeqCst);
@@ -676,7 +685,7 @@ impl TopicManager {
         debug!("订阅选项: max_messages={:?}, message_ttl={:?}, lru_enabled={} / Subscription options: max_messages={:?}, message_ttl={:?}, lru_enabled={}",
                options.max_messages, options.message_ttl, options.lru_enabled, options.max_messages, options.message_ttl, options.lru_enabled);
 
-        let channel = self.get_or_create_topic_with_options(topic.clone(), options.clone()).await;
+        let channel = self.get_or_create_topic_with_options(Arc::new(topic.clone()), options.clone()).await;
         let subscriber = channel.add_subscriber(topic.clone(), None, ConsumptionMode::default()).await;
 
         let count = channel.subscriber_count.load(Ordering::SeqCst);
@@ -689,7 +698,7 @@ impl TopicManager {
         debug!("订阅选项: max_messages={:?}, message_ttl={:?}, lru_enabled={}, 模式: {:?} / Subscription options: max_messages={:?}, message_ttl={:?}, lru_enabled={}, mode: {:?}",
                options.max_messages, options.message_ttl, options.lru_enabled, mode, options.max_messages, options.message_ttl, options.lru_enabled, mode);
 
-        let channel = self.get_or_create_topic_with_options(topic.clone(), options.clone()).await;
+        let channel = self.get_or_create_topic_with_options(Arc::new(topic.clone()), options.clone()).await;
         let subscriber = channel.add_subscriber(topic.clone(), None, mode).await;
 
         let count = channel.subscriber_count.load(Ordering::SeqCst);
@@ -700,7 +709,7 @@ impl TopicManager {
     pub async fn subscribe_group_with_options(&self, topic: String, options: TopicOptions, consumer_id: String, mode: ConsumptionMode) -> anyhow::Result<Subscriber> {
         info!("创建带选项的消费者组订阅者，主题: {}, ID: {} / Creating consumer group subscriber with options, topic: {}, ID: {}", topic, consumer_id, topic, consumer_id);
 
-        let channel = self.get_or_create_topic_with_options(topic.clone(), options.clone()).await;
+        let channel = self.get_or_create_topic_with_options(Arc::new(topic.clone()), options.clone()).await;
         let subscriber = channel.add_subscriber(topic.clone(), Some(consumer_id), mode).await;
 
         let count = channel.subscriber_count.load(Ordering::SeqCst);
@@ -757,7 +766,7 @@ pub async fn delete_topic(&self, topic: &str) -> bool {
     /// 发布消息到分区主题（自动路由）
     pub async fn publish_to_partitioned(&self, message: TopicMessage) -> anyhow::Result<()> {
         let topics = self.partitioned_topics.read().await;
-        if let Some(channel) = topics.get(&message.topic) {
+        if let Some(channel) = topics.get(message.topic.as_str()) {
             let partition = channel.select_partition(&message).await;
             channel.publish_to_partition(message, partition).await
         } else {
@@ -769,14 +778,14 @@ pub async fn delete_topic(&self, topic: &str) -> bool {
     pub async fn publish_batch_to_partitioned(&self, messages: Vec<TopicMessage>) -> anyhow::Result<()> {
         if messages.is_empty() { return Ok(()); }
 
-        let mut topic_groups: HashMap<String, Vec<TopicMessage>> = HashMap::new();
+        let mut topic_groups: HashMap<Arc<String>, Vec<TopicMessage>> = HashMap::new();
         for msg in messages {
             topic_groups.entry(msg.topic.clone()).or_default().push(msg);
         }
 
         for (topic, msgs) in topic_groups {
             let topics = self.partitioned_topics.read().await;
-            if let Some(channel) = topics.get(&topic) {
+            if let Some(channel) = topics.get(topic.as_str()) {
                 // 使用有序批量发布，在可能的情况下保持消息顺序
                 channel.publish_batch_ordered(msgs).await?;
             } else {
@@ -856,13 +865,16 @@ impl Default for TopicManager {
 
 #[async_trait::async_trait]
 impl QueueManager for TopicManager {
-    async fn create_publisher(&self, topic: String) -> Box<dyn crate::mq::traits::MessagePublisher> {
-        Box::new(Publisher::new(self.clone(), topic))
+    type Publisher = Publisher;
+    type Subscriber = Subscriber;
+
+    async fn create_publisher(&self, topic: String) -> Self::Publisher {
+        Publisher::new(self.clone(), topic)
     }
 
-    async fn create_subscriber(&self, topic: String) -> anyhow::Result<Box<dyn crate::mq::traits::MessageSubscriber>> {
+    async fn create_subscriber(&self, topic: String) -> anyhow::Result<Self::Subscriber> {
         let subscriber = self.subscribe(topic).await?;
-        Ok(Box::new(subscriber))
+        Ok(subscriber)
     }
 
     async fn list_topics(&self) -> Vec<String> {
