@@ -44,9 +44,9 @@ graph TD
         TM[TopicManager]
         
         subgraph "Topic Channel (RWLock)"
-            Buffer[Ring Buffer (VecDeque)]
+            Buffer["Ring Buffer (VecDeque)"]
             LRU[LRU Eviction Policy]
-            Stats[Topic Stats & Metrics]
+            Stats["Topic Stats & Metrics"]
         end
         
         subgraph "Partitioned Topic"
@@ -57,9 +57,9 @@ graph TD
     end
 
     subgraph "Consumer Layer"
-        S1[Subscriber (Broadcast)]
-        S2[Consumer Group X - Member 1]
-        S3[Consumer Group X - Member 2]
+        S1["Subscriber (Broadcast)"]
+        S2["Consumer Group X - Member 1"]
+        S3["Consumer Group X - Member 2"]
     end
 
     P1 -->|Publish| TM
