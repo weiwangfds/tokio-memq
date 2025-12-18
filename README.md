@@ -42,9 +42,9 @@ graph TD
         TM[TopicManager]
         
         subgraph "Topic Channel (RWLock)"
-            Buffer[Ring Buffer (VecDeque)]
+            Buffer["Ring Buffer (VecDeque)"]
             LRU[LRU Eviction Policy]
-            Stats[Topic Stats & Metrics]
+            Stats["Topic Stats & Metrics"]
         end
         
         subgraph "Partitioned Topic"
