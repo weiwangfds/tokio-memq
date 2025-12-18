@@ -47,6 +47,7 @@ pub enum SerializationFormat {
     Bincode,
     Json,
     MessagePack,
+    Native,
     Custom(String),
 }
 
@@ -56,6 +57,7 @@ impl SerializationFormat {
             SerializationFormat::Bincode => "bincode",
             SerializationFormat::Json => "json",
             SerializationFormat::MessagePack => "messagepack",
+            SerializationFormat::Native => "native",
             SerializationFormat::Custom(s) => s,
         }
     }
@@ -68,6 +70,7 @@ impl std::str::FromStr for SerializationFormat {
             "bincode" | "binary" => Ok(SerializationFormat::Bincode),
             "json" => Ok(SerializationFormat::Json),
             "msgpack" | "messagepack" => Ok(SerializationFormat::MessagePack),
+            "native" => Ok(SerializationFormat::Native),
             other => Ok(SerializationFormat::Custom(other.to_string())),
         }
     }
@@ -76,7 +79,62 @@ impl std::str::FromStr for SerializationFormat {
 /// Configuration for Bincode serialization
 #[derive(Debug, Clone, Default)]
 pub struct BincodeConfig {
-    // We stick to standard options for now
+    /// 序列化时是否包含字段名称
+    /// Whether to include field names during serialization
+    pub include_field_names: bool,
+    
+    /// 序列化时是否使用小端序
+    /// Whether to use little-endian byte order
+    pub little_endian: bool,
+    
+    /// 序列化时是否限制整数大小
+    /// Whether to limit integer size during serialization
+    pub limit_int_size: Option<u8>,
+    
+    /// 是否启用固定长度整数编码
+    /// Whether to enable fixed-length integer encoding
+    pub fixed_int_encoding: bool,
+}
+
+impl BincodeConfig {
+    /// 创建默认配置
+    /// Create default configuration
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// 创建包含字段名称的配置
+    /// Create configuration with field names included
+    pub fn with_field_names() -> Self {
+        Self {
+            include_field_names: true,
+            little_endian: false,
+            limit_int_size: None,
+            fixed_int_encoding: false,
+        }
+    }
+    
+    /// 创建小端序配置
+    /// Create little-endian configuration
+    pub fn little_endian() -> Self {
+        Self {
+            include_field_names: false,
+            little_endian: true,
+            limit_int_size: None,
+            fixed_int_encoding: false,
+        }
+    }
+    
+    /// 创建紧凑配置（优化大小）
+    /// Create compact configuration (optimized for size)
+    pub fn compact() -> Self {
+        Self {
+            include_field_names: false,
+            little_endian: true,
+            limit_int_size: Some(8),
+            fixed_int_encoding: true,
+        }
+    }
 }
 
 /// Configuration for JSON serialization
@@ -498,6 +556,7 @@ impl SerializationHelper {
             SerializationFormat::Bincode,
             SerializationFormat::Json,
             SerializationFormat::MessagePack,
+            SerializationFormat::Native,
         ]
     }
 
@@ -585,6 +644,7 @@ fn format_code(fmt: &SerializationFormat) -> u8 {
         SerializationFormat::Bincode => 0,
         SerializationFormat::Json => 1,
         SerializationFormat::MessagePack => 2,
+        SerializationFormat::Native => 3,
         SerializationFormat::Custom(_) => 255,
     }
 }

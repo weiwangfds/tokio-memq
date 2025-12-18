@@ -46,6 +46,6 @@ sysinfo = "0.36.1"
 [features]
 default = []
 
-[[bench]]
-name = "mq_benchmark"
-harness = false
+# [[bench]]
+# name = "mq_benchmark"
+# harness = false

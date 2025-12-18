@@ -1,6 +1,39 @@
 use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::any::Any;
 use log::{debug, info, error};
 use super::serializer::{SerializationFormat, SerializationHelper, SerializationError};
+
+#[derive(Clone)]
+pub enum MessagePayload {
+    Bytes(Vec<u8>),
+    Native(Arc<dyn Any + Send + Sync>),
+}
+
+impl std::fmt::Debug for MessagePayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bytes(bytes) => f.debug_tuple("Bytes").field(&bytes.len()).finish(),
+            Self::Native(_) => f.debug_tuple("Native").field(&"opaque object").finish(),
+        }
+    }
+}
+
+impl MessagePayload {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(b) => b.len(),
+            Self::Native(_) => 0, // Native object size unknown
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Bytes(b) => b.is_empty(),
+            Self::Native(_) => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 /// 主题配置选项
@@ -134,7 +167,7 @@ pub struct MessageMetadata {
 /// Topic message payload.
 pub struct TopicMessage {
     pub topic: String,
-    pub payload: Vec<u8>,
+    pub payload: MessagePayload,
     pub format: SerializationFormat,
     pub created_at: Instant,
     pub offset: Option<usize>,
@@ -148,18 +181,30 @@ impl TopicMessage {
     /// 使用默认序列化格式创建消息
     ///
     /// Create a message using the default serialization format.
-    pub fn new<T: serde::Serialize>(topic: String, data: &T) -> Result<Self, SerializationError> {
+    pub fn new<T: serde::Serialize + Send + Sync + 'static>(topic: String, data: T) -> Result<Self, SerializationError> {
         let format = Self::default_format();
         debug!("创建消息，主题: {}, 默认格式: {:?} / Creating message, topic: {}, default format: {:?}", topic, format, topic, format);
         
-        match SerializationHelper::serialize(data, &format) {
-            Ok(payload) => {
+        if format == SerializationFormat::Native {
+            debug!("创建原生消息，主题: {} / Creating native message, topic: {}", topic, topic);
+            return Ok(TopicMessage {
+                topic,
+                payload: MessagePayload::Native(Arc::new(data)),
+                format,
+                created_at: Instant::now(),
+                offset: None,
+                key: None,
+            });
+        }
+
+        match SerializationHelper::serialize(&data, &format) {
+            Ok(bytes) => {
                 debug!("消息创建成功，主题: {}, 格式: {:?}, 大小: {} 字节 / Message created successfully, topic: {}, format: {:?}, size: {} bytes",
-                       topic, format, payload.len(), topic, format, payload.len());
+                       topic, format, bytes.len(), topic, format, bytes.len());
                 
                 Ok(TopicMessage {
                     topic,
-                    payload,
+                    payload: MessagePayload::Bytes(bytes),
                     format,
                     created_at: Instant::now(),
                     offset: None,
@@ -174,24 +219,36 @@ impl TopicMessage {
     }
     
     fn default_format() -> SerializationFormat {
-        SerializationFormat::Bincode
+        SerializationFormat::Native
     }
 
     /// 使用默认序列化格式和键创建消息
     ///
     /// Create a message with default format and key for partition routing.
-    pub fn new_with_key<T: serde::Serialize>(topic: String, data: &T, key: String) -> Result<Self, SerializationError> {
+    pub fn new_with_key<T: serde::Serialize + Send + Sync + 'static>(topic: String, data: T, key: String) -> Result<Self, SerializationError> {
         let format = Self::default_format();
         debug!("创建消息，主题: {}, 默认格式: {:?}, 键: {} / Creating message, topic: {}, default format: {:?}, key: {}", topic, format, key, topic, format, key);
 
-        match SerializationHelper::serialize(data, &format) {
-            Ok(payload) => {
+        if format == SerializationFormat::Native {
+            debug!("创建原生消息，主题: {}, 键: {} / Creating native message, topic: {}, key: {}", topic, key, topic, key);
+            return Ok(TopicMessage {
+                topic,
+                payload: MessagePayload::Native(Arc::new(data)),
+                format,
+                created_at: Instant::now(),
+                offset: None,
+                key: Some(key),
+            });
+        }
+
+        match SerializationHelper::serialize(&data, &format) {
+            Ok(bytes) => {
                 debug!("消息创建成功，主题: {}, 格式: {:?}, 大小: {} 字节, 键: {} / Message created successfully, topic: {}, format: {:?}, size: {} bytes, key: {}",
-                       topic, format, payload.len(), key, topic, format, payload.len(), key);
+                       topic, format, bytes.len(), key, topic, format, bytes.len(), key);
 
                 Ok(TopicMessage {
                     topic,
-                    payload,
+                    payload: MessagePayload::Bytes(bytes),
                     format,
                     created_at: Instant::now(),
                     offset: None,
@@ -208,22 +265,33 @@ impl TopicMessage {
     /// 使用指定序列化格式和键创建消息
     ///
     /// Create a message with specified format and key for partition routing.
-    pub fn new_with_format_and_key<T: serde::Serialize>(
+    pub fn new_with_format_and_key<T: serde::Serialize + Send + Sync + 'static>(
         topic: String,
-        data: &T,
+        data: T,
         format: SerializationFormat,
         key: String
     ) -> Result<Self, SerializationError> {
         debug!("创建消息，主题: {}, 指定格式: {:?}, 键: {} / Creating message, topic: {}, specified format: {:?}, key: {}", topic, format, key, topic, format, key);
 
-        match SerializationHelper::serialize(data, &format) {
-            Ok(payload) => {
+        if format == SerializationFormat::Native {
+             return Ok(TopicMessage {
+                topic,
+                payload: MessagePayload::Native(Arc::new(data)),
+                format,
+                created_at: Instant::now(),
+                offset: None,
+                key: Some(key),
+            });
+        }
+
+        match SerializationHelper::serialize(&data, &format) {
+            Ok(bytes) => {
                 info!("消息创建成功，主题: {}, 格式: {:?}, 大小: {} 字节, 键: {} / Message created successfully, topic: {}, format: {:?}, size: {} bytes, key: {}",
-                      topic, format, payload.len(), key, topic, format, payload.len(), key);
+                      topic, format, bytes.len(), key, topic, format, bytes.len(), key);
 
                 Ok(TopicMessage {
                     topic,
-                    payload,
+                    payload: MessagePayload::Bytes(bytes),
                     format,
                     created_at: Instant::now(),
                     offset: None,
@@ -240,21 +308,32 @@ impl TopicMessage {
     /// 使用指定序列化格式创建消息
     ///
     /// Create a message with a specified `SerializationFormat`.
-    pub fn new_with_format<T: serde::Serialize>(
-        topic: String, 
-        data: &T, 
+    pub fn new_with_format<T: serde::Serialize + Send + Sync + 'static>(
+        topic: String,
+        data: T,
         format: SerializationFormat
     ) -> Result<Self, SerializationError> {
         debug!("创建消息，主题: {}, 指定格式: {:?} / Creating message, topic: {}, specified format: {:?}", topic, format, topic, format);
         
-        match SerializationHelper::serialize(data, &format) {
-            Ok(payload) => {
-                info!("消息创建成功，主题: {}, 格式: {:?}, 大小: {} 字节 / Message created successfully, topic: {}, format: {:?}, size: {} bytes", 
-                      topic, format, payload.len(), topic, format, payload.len());
+        if format == SerializationFormat::Native {
+             return Ok(TopicMessage {
+                topic,
+                payload: MessagePayload::Native(Arc::new(data)),
+                format,
+                created_at: Instant::now(),
+                offset: None,
+                key: None,
+            });
+        }
+
+        match SerializationHelper::serialize(&data, &format) {
+            Ok(bytes) => {
+                info!("消息创建成功，主题: {}, 格式: {:?}, 大小: {} 字节 / Message created successfully, topic: {}, format: {:?}, size: {} bytes",
+                      topic, format, bytes.len(), topic, format, bytes.len());
                 
                 Ok(TopicMessage {
                     topic,
-                    payload,
+                    payload: MessagePayload::Bytes(bytes),
                     format,
                     created_at: Instant::now(),
                     offset: None,
@@ -272,12 +351,12 @@ impl TopicMessage {
     ///
     /// Create a message from raw bytes.
     pub fn from_bytes(topic: String, data: Vec<u8>, format: SerializationFormat) -> Self {
-        debug!("从字节数据创建消息，主题: {}, 格式: {:?}, 大小: {} 字节 / Creating message from bytes, topic: {}, format: {:?}, size: {} bytes", 
+        debug!("从字节数据创建消息，主题: {}, 格式: {:?}, 大小: {} 字节 / Creating message from bytes, topic: {}, format: {:?}, size: {} bytes",
                topic, format, data.len(), topic, format, data.len());
         
         TopicMessage {
             topic,
-            payload: data,
+            payload: MessagePayload::Bytes(data),
             format,
             created_at: Instant::now(),
             offset: None,
@@ -292,12 +371,12 @@ impl TopicMessage {
         let bytes = payload.into_bytes();
         let format = SerializationHelper::auto_detect_format(&bytes);
         
-        debug!("从序列化字符串创建消息，主题: {}, 自动检测格式: {:?}, 大小: {} 字节 / Creating message from serialized string, topic: {}, auto-detected format: {:?}, size: {} bytes", 
+        debug!("从序列化字符串创建消息，主题: {}, 自动检测格式: {:?}, 大小: {} 字节 / Creating message from serialized string, topic: {}, auto-detected format: {:?}, size: {} bytes",
                topic, format, bytes.len(), topic, format, bytes.len());
         
         TopicMessage {
             topic,
-            payload: bytes,
+            payload: MessagePayload::Bytes(bytes),
             format,
             created_at: Instant::now(),
             offset: None,
@@ -309,7 +388,10 @@ impl TopicMessage {
     ///
     /// Get string representation of payload (lossy conversion).
     pub fn payload_str(&self) -> std::borrow::Cow<str> {
-        String::from_utf8_lossy(&self.payload)
+        match &self.payload {
+            MessagePayload::Bytes(bytes) => String::from_utf8_lossy(bytes),
+            MessagePayload::Native(_) => std::borrow::Cow::Borrowed("[Native Object]"),
+        }
     }
 
     /// 创建 Bincode 格式消息
@@ -318,7 +400,7 @@ impl TopicMessage {
     pub fn from_bincode(topic: String, data: Vec<u8>) -> Self {
         TopicMessage {
             topic,
-            payload: data,
+            payload: MessagePayload::Bytes(data),
             format: SerializationFormat::Bincode,
             created_at: Instant::now(),
             offset: None,
@@ -336,25 +418,46 @@ impl TopicMessage {
     /// 反序列化负载为目标类型
     ///
     /// Deserialize payload into target type.
-    pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<T, SerializationError> {
-        SerializationHelper::deserialize(&self.payload, &self.format)
+    pub fn deserialize<T: serde::de::DeserializeOwned + Any + Send + Sync + Clone>(&self) -> Result<T, SerializationError> {
+        match &self.payload {
+            MessagePayload::Bytes(bytes) => SerializationHelper::deserialize(bytes, &self.format),
+            MessagePayload::Native(any) => {
+                 if let Some(val) = any.downcast_ref::<T>() {
+                     Ok(val.clone())
+                 } else {
+                     Err(SerializationError::Custom("Native payload type mismatch".to_string()))
+                 }
+            }
+        }
     }
 
     /// 使用指定格式反序列化负载
     ///
     /// Deserialize payload with a specified `SerializationFormat`.
-    pub fn deserialize_with_format<T: serde::de::DeserializeOwned>(
-        &self, 
+    pub fn deserialize_with_format<T: serde::de::DeserializeOwned + Any + Send + Sync + Clone>(
+        &self,
         format: &SerializationFormat
     ) -> Result<T, SerializationError> {
-        SerializationHelper::deserialize(&self.payload, format)
+        match &self.payload {
+            MessagePayload::Bytes(bytes) => SerializationHelper::deserialize(bytes, format),
+             MessagePayload::Native(any) => {
+                 if let Some(val) = any.downcast_ref::<T>() {
+                     Ok(val.clone())
+                 } else {
+                     Err(SerializationError::Custom("Native payload type mismatch".to_string()))
+                 }
+            }
+        }
     }
 
     /// 获取原始字节负载
     ///
-    /// Get raw payload bytes.
+    /// Get raw payload bytes. Returns empty slice if native.
     pub fn payload_bytes(&self) -> &[u8] {
-        &self.payload
+        match &self.payload {
+            MessagePayload::Bytes(bytes) => bytes,
+            MessagePayload::Native(_) => &[],
+        }
     }
 
     /// 获取字符串负载

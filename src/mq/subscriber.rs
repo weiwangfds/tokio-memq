@@ -253,7 +253,7 @@ impl Subscriber {
 }
 
 impl Subscriber {
-    pub async fn recv_typed<T: serde::de::DeserializeOwned>(&self) -> anyhow::Result<T> {
+    pub async fn recv_typed<T: serde::de::DeserializeOwned + std::any::Any + Send + Sync + Clone>(&self) -> anyhow::Result<T> {
         debug!("等待接收类型化消息，主题: {} / Waiting to receive typed message, topic: {}", self.topic_name, self.topic_name);
         
         let message = self.recv().await?;
@@ -280,7 +280,7 @@ impl Subscriber {
         Ok(payload)
     }
 
-    pub async fn try_recv_typed<T: serde::de::DeserializeOwned>(&self) -> anyhow::Result<T> {
+    pub async fn try_recv_typed<T: serde::de::DeserializeOwned + std::any::Any + Send + Sync + Clone>(&self) -> anyhow::Result<T> {
         debug!("尝试接收类型化消息，主题: {} / Attempting to receive typed message, topic: {}", self.topic_name, self.topic_name);
         
         let message = self.try_recv().await?;
@@ -309,16 +309,16 @@ impl Subscriber {
         Ok(payload)
     }
 
-    pub async fn recv_with_format<T: serde::de::DeserializeOwned>(
-        &self, 
+    pub async fn recv_with_format<T: serde::de::DeserializeOwned + std::any::Any + Send + Sync + Clone>(
+        &self,
         format: SerializationFormat
     ) -> anyhow::Result<T> {
         let message = self.recv().await?;
         message.deserialize_with_format::<T>(&format).map_err(|e| anyhow::anyhow!(e))
     }
 
-    pub async fn try_recv_with_format<T: serde::de::DeserializeOwned>(
-        &self, 
+    pub async fn try_recv_with_format<T: serde::de::DeserializeOwned + std::any::Any + Send + Sync + Clone>(
+        &self,
         format: SerializationFormat
     ) -> anyhow::Result<T> {
         let message = self.try_recv().await?;
@@ -341,7 +341,7 @@ impl Subscriber {
         Ok((message, format))
     }
 
-    pub async fn recv_bincode<T: serde::de::DeserializeOwned>(&self) -> anyhow::Result<T> {
+    pub async fn recv_bincode<T: serde::de::DeserializeOwned + std::any::Any + Send + Sync + Clone>(&self) -> anyhow::Result<T> {
         self.recv_with_format(SerializationFormat::Bincode).await
     }
 

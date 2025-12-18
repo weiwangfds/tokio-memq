@@ -34,17 +34,26 @@ impl Publisher {
     /// 序列化并发布任意可序列化数据
     ///
     /// Serialize and publish any `serde::Serialize` data.
-    pub async fn publish<T: serde::Serialize>(&self, data: &T) -> anyhow::Result<()> {
+    pub async fn publish<T: serde::Serialize + Send + Sync + 'static + Clone>(&self, data: T) -> anyhow::Result<()> {
         debug!("开始序列化并发布消息到主题: {} / Start serializing and publishing message to topic: {}", self.topic, self.topic);
 
         let keyed = self.publisher_key.as_ref().and_then(|k| SerializationFactory::get_publisher_defaults(k));
+        
+        // 检查是否有自定义配置，如果没有，使用默认的 native 格式
         let message = if let Some(settings) = keyed.or_else(|| SerializationFactory::get_topic_defaults(&self.topic)) {
-            let payload = SerializationHelper::serialize_with_settings(data, &settings)?;
-            let format = settings.format.clone();
-            TopicMessage::from_bytes(self.topic.clone(), payload, format)
+             // 如果配置是 Native，则直接传递对象
+            if settings.format == SerializationFormat::Native {
+                TopicMessage::new_with_format(self.topic.clone(), data, SerializationFormat::Native)?
+            } else {
+                let payload = SerializationHelper::serialize_with_settings(&data, &settings)?;
+                let format = settings.format.clone();
+                TopicMessage::from_bytes(self.topic.clone(), payload, format)
+            }
         } else {
+            // 默认情况下，TopicMessage::new 现在使用 Native 格式
             TopicMessage::new(self.topic.clone(), data)?
         };
+        
         debug!("消息创建成功，格式: {:?}, 大小: {} 字节 / Message created successfully, format: {:?}, size: {} bytes", message.format, message.payload.len(), message.format, message.payload.len());
         let summary = message.display_payload(256);
         info!("发布内容到主题 {}: {} / Publishing content to topic {}: {}", self.topic, summary, self.topic, summary);
@@ -74,9 +83,9 @@ impl Publisher {
     /// 指定序列化格式发布数据
     ///
     /// Publish data using a specified `SerializationFormat`.
-    pub async fn publish_with_format<T: serde::Serialize>(
-        &self, 
-        data: &T, 
+    pub async fn publish_with_format<T: serde::Serialize + Send + Sync + 'static>(
+        &self,
+        data: T,
         format: SerializationFormat
     ) -> anyhow::Result<()> {
         debug!("使用 {:?} 格式发布消息到主题: {} / Publishing message to topic: {} using format: {:?}", format, self.topic, self.topic, format);
@@ -92,7 +101,7 @@ impl Publisher {
     /// 使用 Bincode 格式发布数据
     ///
     /// Publish data using `Bincode` format.
-    pub async fn publish_bincode<T: serde::Serialize>(&self, data: &T) -> anyhow::Result<()> {
+    pub async fn publish_bincode<T: serde::Serialize + Send + Sync + 'static>(&self, data: T) -> anyhow::Result<()> {
         self.publish_with_format(data, SerializationFormat::Bincode).await
     }
 
@@ -123,16 +132,20 @@ impl Publisher {
     /// 批量发布消息
     ///
     /// Batch publish messages.
-    pub async fn publish_batch<T: serde::Serialize>(&self, data_list: Vec<T>) -> anyhow::Result<()> {
+    pub async fn publish_batch<T: serde::Serialize + Send + Sync + 'static + Clone>(&self, data_list: Vec<T>) -> anyhow::Result<()> {
         let mut messages = Vec::with_capacity(data_list.len());
         for data in data_list {
             let keyed = self.publisher_key.as_ref().and_then(|k| SerializationFactory::get_publisher_defaults(k));
             if let Some(settings) = keyed.or_else(|| SerializationFactory::get_topic_defaults(&self.topic)) {
-                let payload = SerializationHelper::serialize_with_settings(&data, &settings)?;
-                let format = settings.format.clone();
-                messages.push(TopicMessage::from_bytes(self.topic.clone(), payload, format));
+                if settings.format == SerializationFormat::Native {
+                    messages.push(TopicMessage::new_with_format(self.topic.clone(), data, SerializationFormat::Native)?);
+                } else {
+                    let payload = SerializationHelper::serialize_with_settings(&data, &settings)?;
+                    let format = settings.format.clone();
+                    messages.push(TopicMessage::from_bytes(self.topic.clone(), payload, format));
+                }
             } else {
-                messages.push(TopicMessage::new(self.topic.clone(), &data)?);
+                messages.push(TopicMessage::new(self.topic.clone(), data)?);
             }
         }
         self.topic_manager.publish_batch(messages).await
@@ -141,14 +154,14 @@ impl Publisher {
     /// 使用指定格式批量发布消息
     ///
     /// Batch publish messages with specified format.
-    pub async fn publish_batch_with_format<T: serde::Serialize>(
-        &self, 
-        data_list: Vec<T>, 
+    pub async fn publish_batch_with_format<T: serde::Serialize + Send + Sync + 'static>(
+        &self,
+        data_list: Vec<T>,
         format: SerializationFormat
     ) -> anyhow::Result<()> {
         let mut messages = Vec::with_capacity(data_list.len());
         for data in data_list {
-            messages.push(TopicMessage::new_with_format(self.topic.clone(), &data, format.clone())?);
+            messages.push(TopicMessage::new_with_format(self.topic.clone(), data, format.clone())?);
         }
         self.topic_manager.publish_batch(messages).await
     }
