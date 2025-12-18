@@ -289,7 +289,7 @@ flowchart LR
   SUB -- deserialize --> SER
 ```
 
-- ## Sequence Diagram
+## Sequence Diagram
 
 ```mermaid
 sequenceDiagram
